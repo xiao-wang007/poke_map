@@ -30,7 +30,7 @@ def print_joint_positions_callback(dt, context):
 joint_logging_callback_id = None
 
 
-def enable_joint_logging():
+def enable_joint_print():
     global joint_logging_callback_id
     if joint_logging_callback_id is None:
         joint_logging_callback_id = SimulationManager.register_callback(
@@ -40,7 +40,7 @@ def enable_joint_logging():
         print("Joint position logging enabled.")
 
 
-def disable_joint_logging():
+def disable_joint_print():
     global joint_logging_callback_id
     if joint_logging_callback_id is not None:
         SimulationManager.deregister_callback(joint_logging_callback_id)
@@ -48,7 +48,8 @@ def disable_joint_logging():
         print("Joint position logging disabled.")
 
 
-enable_joint_logging()
+# enable_joint_print()
+# disable_joint_print()
 
 
 #! control the robot using Articulation API at the joint level
