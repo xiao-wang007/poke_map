@@ -116,3 +116,69 @@ finger_articulation.get_dof_positions()                  # current joint state
 The script is idempotent — re-running it safely clears old handles and rebuilds. It integrates with `scene_setup_vectorized.py`'s existing stage (doesn't create a new one if ground/light already exist).
 
 Made changes.
+
+
+
+------------------------------------------------------------
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#200-200), lines 200 to 300
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#295-295), lines 295 to 320
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#320-320), lines 320 to 340
+
+Yes, the `main()` call at the bottom got dropped during the replacement. The function is defined but never called. Let me fix it:
+
+
+
+
+```
+
+```
+Now let me verify the end of the file is complete:
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#325-325), lines 325 to 345
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#335-335), lines 335 to 350
+
+The file is corrupted — old content got left at the end. Let me read the full file and rewrite it cleanly.
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#1-1), lines 1 to 400
+
+The file has old remnants appended. I'll clean it by removing everything after the first `main()` call.
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#340-340), lines 340 to 433
+
+The old version's remnants start right after the first `main()` call. Let me strip them out:
+
+
+
+
+```
+
+```
+Let me verify the end is clean now:
+
+Read [](file:///home/xiao/0_codes/poke_map/add_finger_robot.py#325-325), lines 325 to 343
+
+✅ **Fixed.** The file is clean now — the old version's remnants (duplicate `main()`, stale `move_finger_to`, standalone entry point, etc.) have been removed. 
+
+The file now ends cleanly at line 342 with:
+
+```python
+    # --- Expose to globals for interactive use ---
+    globals().update(
+        {
+            "finger_articulation": finger_articulation,
+            "finger_actuators": finger_actuators,
+            "finger_root_xform": finger_root_xform,
+        }
+    )
+
+
+main()
+```
+
+Sorry about that — the initial `replace_string_in_file` used a shorter `oldString` that matched the beginning of the file but didn't capture the tail end, leaving a Frankenstein of old+new glued together. It's all cleaned up now.
+
+Made changes.
