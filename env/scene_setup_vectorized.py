@@ -1,9 +1,11 @@
 import gc
+from pathlib import Path
+import sys
 
 from isaacsim.core.cloner import GridCloner
 from isaacsim.core.experimental.materials import PreviewSurfaceMaterial
 from isaacsim.core.experimental.objects import Cube, Cylinder, DistantLight, GroundPlane
-from isaacsim.core.experimental.prims import GeomPrim, RigidPrim, XformPrim
+from isaacsim.core.experimental.prims import Articulation, GeomPrim, RigidPrim, XformPrim
 import isaacsim.core.experimental.utils.stage as stage_utils
 from isaacsim.core.rendering_manager import ViewportManager
 import numpy as np
@@ -14,6 +16,19 @@ import isaacsim.core.experimental.utils.app as app_utils
 
 #! for running async task safely 
 from omni.kit.async_engine import run_coroutine
+
+PROJECT_ENV_DIR = Path("/home/xiao/0_codes/poke_map/env")
+if PROJECT_ENV_DIR.exists() and str(PROJECT_ENV_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ENV_DIR))
+
+from make_finger_robot import (
+    DEFAULT_XYZ,
+    DRIVE_DAMPING_RANGE,
+    DRIVE_STIFFNESS_RANGE,
+    FINGERTIP_MASS_RANGE,
+    build_finger_articulation,
+    configure_drives,
+)
 
 
 OBJECT_HEIGHT = 0.05
@@ -27,6 +42,9 @@ NUM_ENVS = 12
 ENV_SPACING = 1.2
 ENVS_ROOT_PATH = "/World/envs"
 SOURCE_ENV_PATH = f"{ENVS_ROOT_PATH}/env_0"
+FINGER_LOCAL_ROOT_PATH = "FingerRobot"
+FINGER_ROOT_PATTERN = f"{ENVS_ROOT_PATH}/env_.*/{FINGER_LOCAL_ROOT_PATH}"
+FINGER_TIP_LINK_PATTERN = f"{FINGER_ROOT_PATTERN}/z_link"
 
 L_OBJECT_LOCAL_POSITION = [-0.10, -0.06, 0.0]
 CYLINDER_LOCAL_POSITION = [0.10, 0.02, OBJECT_HEIGHT * 0.5]
@@ -73,6 +91,11 @@ def clear_previous_handles():
         "env_paths",
         "cloner",
         "randomized_poses",
+        "source_finger_root_xform",
+        "finger_articulations",
+        "finger_tip_links",
+        "finger_settle_task",
+        "randomized_finger_properties",
     ):
         globals().pop(handle_name, None)
     gc.collect()
@@ -159,6 +182,10 @@ def create_source_env(path, l_material, cylinder_material):
         height=OBJECT_HEIGHT,
         material=cylinder_material,
     )
+    source_finger_root_xform = build_finger_articulation(
+        root_path=f"{path}/{FINGER_LOCAL_ROOT_PATH}",
+        root_position=[0.0, 0.0, 0.0],
+    )
     return (
         source_env,
         l_parts,
@@ -168,6 +195,7 @@ def create_source_env(path, l_material, cylinder_material):
         cylinder_shape,
         cylinder_geometry,
         cylinder_object,
+        source_finger_root_xform,
     )
 
 
@@ -248,19 +276,87 @@ def randomize_object_poses(env_roots, l_objects, cylinder_objects, seed=None):
     }
 
 
+def randomize_finger_properties(finger_articulations, finger_tip_links, seed=None):
+    rng = np.random.default_rng(seed)
+    num_fingers = len(finger_articulations)
+    num_dofs = finger_articulations.num_dofs
+
+    stiffnesses = rng.uniform(
+        DRIVE_STIFFNESS_RANGE[0],
+        DRIVE_STIFFNESS_RANGE[1],
+        size=(num_fingers, num_dofs),
+    ).astype(np.float32)
+    dampings = rng.uniform(
+        DRIVE_DAMPING_RANGE[0],
+        DRIVE_DAMPING_RANGE[1],
+        size=(num_fingers, num_dofs),
+    ).astype(np.float32)
+    fingertip_masses = rng.uniform(
+        FINGERTIP_MASS_RANGE[0],
+        FINGERTIP_MASS_RANGE[1],
+        size=(num_fingers, 1),
+    ).astype(np.float32)
+
+    finger_tip_links.set_masses(fingertip_masses)
+
+    return {
+        "stiffnesses": stiffnesses,
+        "dampings": dampings,
+        "fingertip_masses": fingertip_masses,
+    }
+
+
 #! need to step the app in async mode as the script editor is already in this mode
 #! so app_utils.update_app(steps=DELAY_TO_SETTLE) gives erros
-async def settle_scene_async(steps):
+def move_fingers_to(finger_articulations, xyz, num_steps=120):
+    dof_indices = finger_articulations.get_dof_indices(finger_articulations.dof_names)
+    finger_articulations.set_dof_position_targets(
+        positions=list(xyz),
+        dof_indices=dof_indices,
+    )
+    return run_coroutine(settle_scene_async(num_steps))
+
+
+async def settle_scene_async(
+    steps,
+    finger_articulations=None,
+    finger_target=None,
+    finger_properties=None,
+):
     app_utils.play()
-    await app_utils.update_app_async(steps=steps)
+    await app_utils.update_app_async(steps=1)
+    if finger_articulations is not None:
+        if finger_properties is None:
+            configure_drives(finger_articulations)
+        else:
+            configure_drives(
+                finger_articulations,
+                stiffnesses=finger_properties["stiffnesses"],
+                dampings=finger_properties["dampings"],
+            )
+        if finger_target is not None:
+            dof_indices = finger_articulations.get_dof_indices(finger_articulations.dof_names)
+            finger_articulations.set_dof_position_targets(
+                positions=list(finger_target),
+                dof_indices=dof_indices,
+            )
+    if steps > 1:
+        await app_utils.update_app_async(steps=steps - 1)
     print(f"Settled scene for {steps} app update steps.")
 
 
 #! run_coroutine is needed as async function cannot be called directly from the
 #! main(). run_coroutine() tells isaac to run the async task safely through Kit's
 #! event loop
-def schedule_settle_scene(steps):
-    return run_coroutine(settle_scene_async(steps))
+def schedule_settle_scene(
+    steps,
+    finger_articulations=None,
+    finger_target=None,
+    finger_properties=None,
+):
+    return run_coroutine(
+        settle_scene_async(steps, finger_articulations, finger_target, finger_properties)
+    )
 
 
 def main():
@@ -279,6 +375,8 @@ def main():
     cylinder_material = PreviewSurfaceMaterial("/VisualMaterials/cylinder_orange")
     cylinder_material.set_input_values("diffuseColor", [1.0, 0.45, 0.05])
 
+
+    #! create a source env with L-shaped object, cylinder, and finger robot
     (
         source_env,
         l_parts,
@@ -288,8 +386,10 @@ def main():
         cylinder_shape,
         cylinder_geometry,
         cylinder_object,
+        source_finger_root_xform,
     ) = create_source_env(SOURCE_ENV_PATH, l_material, cylinder_material)
 
+    #! replicate the source env here
     cloner, env_paths = clone_envs(
         source_env_path=SOURCE_ENV_PATH,
         num_envs=NUM_ENVS,
@@ -299,8 +399,11 @@ def main():
     env_roots = XformPrim(paths=f"{ENVS_ROOT_PATH}/env_.*")
     l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
     cylinder_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
+    finger_articulations = Articulation(paths=FINGER_ROOT_PATTERN)
+    finger_tip_links = RigidPrim(paths=FINGER_TIP_LINK_PATTERN)
 
     randomized_poses = None
+    randomized_finger_properties = None
     if RANDOMIZE_ON_START:
         randomized_poses = randomize_object_poses(
             env_roots=env_roots,
@@ -308,9 +411,19 @@ def main():
             cylinder_objects=cylinder_objects,
             seed=RANDOM_SEED,
         )
+        randomized_finger_properties = randomize_finger_properties(
+            finger_articulations=finger_articulations,
+            finger_tip_links=finger_tip_links,
+            seed=RANDOM_SEED + 1,
+        )
     
     #! asynchronously forward the physics to resolve overlap after randomization
-    settle_task = schedule_settle_scene(DELAY_TO_SETTLE)
+    settle_task = schedule_settle_scene(
+        DELAY_TO_SETTLE,
+        finger_articulations=finger_articulations,
+        finger_target=DEFAULT_XYZ,
+        finger_properties=randomized_finger_properties,
+    )
 
     ViewportManager.set_camera_view(
         "/OmniverseKit_Persp",
@@ -343,8 +456,24 @@ def main():
             "cloner": cloner,
             "randomized_poses": randomized_poses,
             "settle_task": settle_task,
+            "source_finger_root_xform": source_finger_root_xform,
+            "finger_articulations": finger_articulations,
+            "finger_tip_links": finger_tip_links,
+            "move_fingers_to": move_fingers_to,
+            "randomized_finger_properties": randomized_finger_properties,
         }
     )
 
 
 main()
+
+
+#! ---------------------------------------------------------------------------
+#! The workflow convention here
+#! ---------------------------------------------------------------------------
+#! one USD stage
+#! └── many envs
+#!     ├── env_0/FingerRobot  ← articulation instance 0
+#!     ├── env_1/FingerRobot  ← articulation instance 1
+#!     ├── env_2/FingerRobot  ← articulation instance 2
+#! ---------------------------------------------------------------------------
