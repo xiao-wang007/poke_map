@@ -23,6 +23,8 @@ Usage (script editor)::
 from __future__ import annotations
 
 import gc
+from pathlib import Path
+import sys
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 import numpy as np
@@ -32,10 +34,22 @@ from isaacsim.core.experimental.objects import DistantLight, GroundPlane
 from isaacsim.core.experimental.prims import Articulation, RigidPrim, XformPrim
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ENV_DIR = Path("/home/xiao/0_codes/poke_map/env")
+
+for module_dir in (CURRENT_DIR, PROJECT_ENV_DIR):
+    if module_dir.exists() and str(module_dir) not in sys.path:
+        sys.path.insert(0, str(module_dir))
+
+from config_loader import load_config
+
+CONFIG = load_config()
+FINGER_CONFIG = CONFIG["finger"]
+
 # ---------------------------------------------------------------------------
 #  Constants
 # ---------------------------------------------------------------------------
-FINGER_ROOT_PATH = "/World/FingerRobot"
+FINGER_ROOT_PATH = FINGER_CONFIG["standalone_root_path"]
 BASE_PATH = f"{FINGER_ROOT_PATH}/base"
 X_LINK_PATH = f"{FINGER_ROOT_PATH}/x_link"
 Y_LINK_PATH = f"{FINGER_ROOT_PATH}/y_link"
@@ -45,27 +59,27 @@ X_JOINT_PATH = f"{FINGER_ROOT_PATH}/x_joint"
 Y_JOINT_PATH = f"{FINGER_ROOT_PATH}/y_joint"
 Z_JOINT_PATH = f"{FINGER_ROOT_PATH}/z_joint"
 
-SPHERE_RADIUS = 0.0125  # finger-tip sphere radius (m)
-BOX_HALF = 0.008       # intermediate link visual half-size (m)
+SPHERE_RADIUS = FINGER_CONFIG["sphere_radius"]  # finger-tip sphere radius (m)
+BOX_HALF = FINGER_CONFIG["box_half"]       # intermediate link visual half-size (m)
 
 # Prismatic joint limits in meters (span the Franka EE workspace)
-LIMIT_LOWER = [-0.25, -0.25, -0.05]
-LIMIT_UPPER = [0.25, 0.25, 0.25]
+LIMIT_LOWER = FINGER_CONFIG["limit_lower"]
+LIMIT_UPPER = FINGER_CONFIG["limit_upper"]
 
 # USD DriveAPI gains (applied by the physics solver directly)
 # stiffness = position gain (N/m), damping = velocity gain (N·s/m)
-DRIVE_STIFFNESS = 1000.0  # N/m
-DRIVE_DAMPING   = 100.0   # N·s/m
-DRIVE_MAX_FORCE = 500.0   # N
-DEFAULT_FINGERTIP_MASS = 1.0  # kg, authored on z_link rigid body
+DRIVE_STIFFNESS = FINGER_CONFIG["drive_stiffness"]  # N/m
+DRIVE_DAMPING   = FINGER_CONFIG["drive_damping"]   # N·s/m
+DRIVE_MAX_FORCE = FINGER_CONFIG["drive_max_force"]   # N
+DEFAULT_FINGERTIP_MASS = FINGER_CONFIG["default_fingertip_mass"]  # kg, authored on z_link rigid body
 
 # Optional randomization ranges used by vectorized scene setup.
-DRIVE_STIFFNESS_RANGE = [600.0, 1400.0]  # N/m
-DRIVE_DAMPING_RANGE = [60.0, 160.0]      # N·s/m
-FINGERTIP_MASS_RANGE = [0.02, 0.10]      # kg
+DRIVE_STIFFNESS_RANGE = FINGER_CONFIG["drive_stiffness_range"]  # N/m
+DRIVE_DAMPING_RANGE = FINGER_CONFIG["drive_damping_range"]      # N·s/m
+FINGERTIP_MASS_RANGE = FINGER_CONFIG["fingertip_mass_range"]      # kg
 
 # Default starting pose
-DEFAULT_XYZ = [0.0, 0.0, 0.2] # (m) default z position 20cm 
+DEFAULT_XYZ = FINGER_CONFIG["default_xyz"] # (m) default z position 20cm 
 
 
 def get_finger_paths(root_path=FINGER_ROOT_PATH):
@@ -122,9 +136,10 @@ def _apply_rigid_body(stage, path, mass_kg=0.05):
 
 
 def _add_box_visual(stage, path, color_rgb):
-    """Small box to mark a link's location (visual only — no collision)."""
+    """Hidden marker for intermediate links."""
     cube = UsdGeom.Cube.Define(stage, path)
     cube.CreateSizeAttr(BOX_HALF * 2.0)
+    cube.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
     prim = stage.GetPrimAtPath(path)
     attr = prim.CreateAttribute(
         "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray
