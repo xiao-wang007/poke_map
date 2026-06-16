@@ -26,7 +26,7 @@ if str(VISION_DIR) not in sys.path:
 import camera as camera_module
 camera_module = importlib.reload(camera_module)
 from camera import (          # vision/camera.py
-    create_overhead_camera,
+    create_overhead_cameras_vectorized,
     get_camera_intrinsics,
     get_object_poses_vectorized,
     render_segmentation_ground_truth,
@@ -39,7 +39,7 @@ from camera import (          # vision/camera.py
 )
 import torch
 
-
+save_contours_to_img = True
 SAVE_DIR = Path("/home/xiao/0_codes/poke_map/vision_outputs")
 
 
@@ -89,13 +89,15 @@ def main():
     print(f"    LObject pixel  : ({l_pix[0, 0]}, {l_pix[0, 1]})  in_view={l_ok}")
     print(f"    Cylinder pixel : ({c_pix[0, 0]}, {c_pix[0, 1]})  in_view={c_ok}")
 
-    #! one camera looking at vectorized envs
+    #! one camera per vectorized env
     #* ------------------------------------------------------------------
-    #* Step 1 — Create the overhead camera 
+    #* Step 1 — Create the overhead cameras
     #* ------------------------------------------------------------------
-    print(">>> Step 1: Creating overhead camera ...")
-    camera = create_overhead_camera(resolution=resolution)
+    print(">>> Step 1: Creating one overhead camera per env ...")
+    cameras, camera_paths = create_overhead_cameras_vectorized(resolution=resolution)
     K = get_camera_intrinsics(resolution)
+    print(f"    camera count = {len(cameras)}")
+    print(f"    first camera = {camera_paths[0] if camera_paths else None}")
     print(f"    K =\n{K}")
 
     #* ------------------------------------------------------------------
@@ -115,11 +117,15 @@ def main():
     seg_maps = render_segmentation_ground_truth(env_poses, K, resolution, env_root_pos=env_root_pos)
 
     #* ------------------------------------------------------------------
-    #* Step 4 — Extract contour_current for env_0
+    #* Step 4 — Extract contour_current for every env
     #* ------------------------------------------------------------------
-    print(">>> Step 4: Extracting contour_current (env_0) ...")
-    contour_current = segmentation_to_contour_current(seg_maps[0])
-    print(f"    contour pixels : {int(contour_current.sum())}")
+    print(">>> Step 4: Extracting contour_current for every env ...")
+    contour_currents = [
+        segmentation_to_contour_current(seg_maps[env_idx])
+        for env_idx in range(num_envs)
+    ]
+    contour_current = contour_currents[0]
+    print(f"    env_0 contour pixels : {int(contour_current.sum())}")
 
     #* ------------------------------------------------------------------
     #* Step 5 — Render contour_goal in env-local coords
@@ -146,18 +152,34 @@ def main():
     #* ------------------------------------------------------------------
     #* Step 5.5 — Save contours for inspection
     #* ------------------------------------------------------------------
-    print(">>> Step 5.5: Saving contours ...")
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    contour_current_png = SAVE_DIR / "contour_current_env0.png"
-    contour_goal_png = SAVE_DIR / "contour_goal_env0.png"
-    contour_current_npy = SAVE_DIR / "contour_current_env0.npy"
-    contour_goal_npy = SAVE_DIR / "contour_goal_env0.npy"
-    save_binary_image(contour_current, contour_current_png)
-    save_binary_image(contour_goal, contour_goal_png)
-    np.save(contour_current_npy, contour_current)
-    np.save(contour_goal_npy, contour_goal)
-    print(f"    saved current PNG : {contour_current_png}")
-    print(f"    saved goal PNG    : {contour_goal_png}")
+    if save_contours_to_img:
+        print(">>> Step 5.5: Saving all contours ...")
+        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        contour_current_pngs = []
+        contour_goal_pngs = []
+        contour_current_npys = []
+        contour_goal_npys = []
+
+        for env_idx, contour_current_env in enumerate(contour_currents):
+            contour_current_png = SAVE_DIR / f"contour_current_env_{env_idx:03d}.png"
+            contour_goal_png = SAVE_DIR / f"contour_goal_env_{env_idx:03d}.png"
+            contour_current_npy = SAVE_DIR / f"contour_current_env_{env_idx:03d}.npy"
+            contour_goal_npy = SAVE_DIR / f"contour_goal_env_{env_idx:03d}.npy"
+
+            save_binary_image(contour_current_env, contour_current_png)
+            save_binary_image(contour_goal, contour_goal_png)
+            np.save(contour_current_npy, contour_current_env)
+            np.save(contour_goal_npy, contour_goal)
+
+            contour_current_pngs.append(contour_current_png)
+            contour_goal_pngs.append(contour_goal_png)
+            contour_current_npys.append(contour_current_npy)
+            contour_goal_npys.append(contour_goal_npy)
+
+        print(f"    saved {len(contour_current_pngs)} current contour PNGs")
+        print(f"    saved {len(contour_goal_pngs)} goal contour PNGs")
+        print(f"    first current PNG : {contour_current_pngs[0]}")
+        print(f"    first goal PNG    : {contour_goal_pngs[0]}")
 
     #* ------------------------------------------------------------------
     #* Step 6 — Stack into input tensor
@@ -189,28 +211,52 @@ def main():
     #* ------------------------------------------------------------------
     #* Expose everything so you can inspect interactively
     #* ------------------------------------------------------------------
-    globals().update(
-        {
-            "camera": camera,
-            "K": K,
-            "resolution": resolution,
-            "env_poses": env_poses,
-            "env_root_pos": env_root_pos,
-            "seg_maps": seg_maps,
-            "contour_current": contour_current,
-            "contour_goal": contour_goal,
-            "save_dir": SAVE_DIR,
-            "contour_current_png": contour_current_png,
-            "contour_goal_png": contour_goal_png,
-            "contour_current_npy": contour_current_npy,
-            "contour_goal_npy": contour_goal_npy,
-            "x": x,
-            "qnet": qnet,
-            "q_map": q_map,
-            "best_pixel": best_pixel,
-            "world_xyz": world_xyz,
-        }
-    )
+    if save_contours_to_img:
+        globals().update(
+            {
+                "cameras": cameras,
+                "camera_paths": camera_paths,
+                "K": K,
+                "resolution": resolution,
+                "env_poses": env_poses,
+                "env_root_pos": env_root_pos,
+                "seg_maps": seg_maps,
+                "contour_currents": contour_currents,
+                "contour_current": contour_current,
+                "contour_goal": contour_goal,
+                "save_dir": SAVE_DIR,
+                "contour_current_pngs": contour_current_pngs,
+                "contour_goal_pngs": contour_goal_pngs,
+                "contour_current_npys": contour_current_npys,
+                "contour_goal_npys": contour_goal_npys,
+                "x": x,
+                "qnet": qnet,
+                "q_map": q_map,
+                "best_pixel": best_pixel,
+                "world_xyz": world_xyz,
+            }
+        )
+    
+    else:
+        globals().update(
+            {
+                "cameras": cameras,
+                "camera_paths": camera_paths,
+                "K": K,
+                "resolution": resolution,
+                "env_poses": env_poses,
+                "env_root_pos": env_root_pos,
+                "seg_maps": seg_maps,
+                "contour_currents": contour_currents,
+                "contour_current": contour_current,
+                "contour_goal": contour_goal,
+                "x": x,
+                "qnet": qnet,
+                "q_map": q_map,
+                "best_pixel": best_pixel,
+                "world_xyz": world_xyz,
+            }
+        )
 
     print("\nDone.  Inspect the globals above — e.g.  q_map, contour_current, seg_maps[0].")
     print("Use 'import matplotlib.pyplot as plt; plt.imshow(q_map); plt.show()' to visualise.")

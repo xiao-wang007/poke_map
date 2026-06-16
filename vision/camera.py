@@ -55,9 +55,9 @@ CYLINDER_PATTERN = f"{ENVS_ROOT_PATH}/env_.*/Cylinder"
 OBJECT_HEIGHT = SCENE_CONFIG["object_height"]
 
 
-# ================================================================
-#  Component 1: Overhead camera + ground-truth segmentation
-# ================================================================
+#* ================================================================
+#*  Component 1: Overhead camera + ground-truth segmentation
+#* ================================================================
 
 def _require_isaac():
     if not _HAS_ISAAC:
@@ -122,6 +122,64 @@ def create_overhead_camera(
         f"(h={height} m, {resolution[0]}×{resolution[1]})"
     )
     return camera
+
+
+def get_env_paths_vectorized(envs_root_path: str = ENVS_ROOT_PATH) -> list[str]:
+    """Return vectorized env root paths, e.g. /World/envs/env_0, env_1, ..."""
+    _require_isaac()
+    stage = stage_utils.get_current_stage(backend="usd")
+    envs_root = stage.GetPrimAtPath(envs_root_path)
+    if not envs_root or not envs_root.IsValid():
+        raise RuntimeError(
+            f"No vectorized env root found at {envs_root_path}. "
+            "Run env/scene_setup_vectorized.py first."
+        )
+
+    def env_sort_key(path: str):
+        name = path.rsplit("/", 1)[-1]
+        if name.startswith("env_") and name[4:].isdigit():
+            return int(name[4:])
+        return name
+
+    env_paths = [
+        str(child.GetPath())
+        for child in envs_root.GetChildren()
+        if child.GetName().startswith("env_")
+    ]
+    return sorted(env_paths, key=env_sort_key)
+
+
+def create_overhead_cameras_vectorized(
+    height: float = CAMERA_HEIGHT,
+    resolution: tuple[int, int] = RESOLUTION,
+    camera_name: str = "OverheadCamera",
+    focal_length: float = 24.0,
+    envs_root_path: str = ENVS_ROOT_PATH,
+) -> tuple[list, list[str]]:
+    """Create one overhead camera under each vectorized environment.
+
+    Cameras are parented under each env root, so their transform is env-local:
+    /World/envs/env_0/OverheadCamera at local (0, 0, height), etc.
+    """
+    env_paths = get_env_paths_vectorized(envs_root_path=envs_root_path)
+    cameras = []
+    camera_paths = []
+
+    for env_path in env_paths:
+        camera_path = f"{env_path}/{camera_name}"
+        cameras.append(
+            create_overhead_camera(
+                height=height,
+                position=(0.0, 0.0),
+                resolution=resolution,
+                camera_path=camera_path,
+                focal_length=focal_length,
+            )
+        )
+        camera_paths.append(camera_path)
+
+    print(f"Created {len(cameras)} vectorized overhead cameras.")
+    return cameras, camera_paths
 
 
 def get_camera_intrinsics(
@@ -493,9 +551,9 @@ def render_segmentation_ground_truth(
     return seg_maps
 
 
-# ================================================================
-#  Component 2: Contour extraction
-# ================================================================
+#* ================================================================
+#*  Component 2: Contour extraction
+#* ================================================================
 
 def mask_to_contour(
     binary_mask: np.ndarray,
@@ -546,9 +604,9 @@ def segmentation_to_contour_current(
     return combined.astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Goal contour rendering (projects objects at target poses)
-# ---------------------------------------------------------------------------
+#* ---------------------------------------------------------------------------
+#* Goal contour rendering (projects objects at target poses)
+#* ---------------------------------------------------------------------------
 
 def render_goal_contour(
     target_positions: dict[str, np.ndarray],   # object_name → (N, 3)
@@ -625,9 +683,9 @@ def render_goal_contour_scene(
     return mask_to_contour(combined, kernel_size=kernel_size).astype(np.float32)
 
 
-# ================================================================
-#  Component 3: Input stacking
-# ================================================================
+#* ================================================================
+#*  Component 3: Input stacking
+#* ================================================================
 
 def stack_input(
     contour_current: np.ndarray,  # (H, W) or (N, H, W)
@@ -656,9 +714,9 @@ def stack_input(
     return torch.cat([current, goal], dim=-3)  # cat along channel dim
 
 
-# ================================================================
-#  Component 4: Q-Network (U-Net)
-# ================================================================
+#* ================================================================
+#*  Component 4: Q-Network (U-Net)
+#* ================================================================
 
 class DoubleConv(nn.Module):
     """(Conv → GN → ReLU) × 2."""
@@ -804,9 +862,9 @@ class QNetwork(nn.Module):
         return q_map[torch.arange(B), pixel_indices[:, 0], pixel_indices[:, 1]]
 
 
-# ================================================================
-#  High-level pipeline
-# ================================================================
+#* ================================================================
+#*  High-level pipeline
+#* ================================================================
 
 def build_vision_observation(
     env_poses: dict,
@@ -865,9 +923,9 @@ def build_vision_observation(
     return x, seg_maps
 
 
-# ================================================================
-#  Utility
-# ================================================================
+#* ================================================================
+#*  Utility
+#* ================================================================
 
 def as_numpy(values):
     """Convert torch tensor / Isaac Sim wp.array / list-of-Vec3 to numpy.
