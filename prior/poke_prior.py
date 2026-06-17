@@ -15,6 +15,40 @@ from vision.camera import (
 )
 
 
+def normalize(v):
+    norm = np.linalg.norm(v)
+    if norm < 1e-8:
+        return np.zeros_like(v)
+    return v / norm
+
+def sample_pixel_on_farside(contour_pixel_coords, obj_init_CoM_pixel, direction, num_samples=20, w=0.1):
+    weights = []
+    for coord in contour_pixel_coords:
+        offset = coord - obj_init_CoM_pixel
+        #* negation makes obtuse angle (far) positive, acute angle (near) negative
+        #* then cap at 0. This is a soft preference.
+        far_side_score = max(0, -np.dot(offset, direction))
+
+        #* converts geometric score into a sampling weight
+        #* baseline = 1.0 ensures near-side pixels still have non-zero chance of
+        #* being sampled.
+        weights.append(1.0 + w * far_side_score)
+    
+    weights = np.array(weights)
+    weights /= np.sum(weights)  # Normalize to sum to 1
+
+    sampled_indices = np.random.choice(
+        len(contour_pixel_coords), 
+        size=num_samples, 
+        p=weights,
+        replace=False)
+
+    sampled_pixels = contour_pixel_coords[sampled_indices]
+    return sampled_pixels  
+
+
+def simulate_poke(isaac_world, obj_name, world_xy, direction):
+    pass
 
 
 #* ================================================================
@@ -43,19 +77,19 @@ def compute_prior(
         # Extract per-object binary mask from seg_map
         obj_mask = (seg_map == obj_id)
 
-        # Extract contour from per-object mask (reuse mask_to_contour from line 558)
-        obj_contour = mask_to_contour(obj_mask)
+        # Extract contour from per-object mask 
+        obj_contour, centre_pixel = mask_to_contour(obj_mask)
 
-        #! this is the metric part to build the prior heatmap
+        #* this is the metric part to build the prior heatmap
         obj_pos = positions[0, :2]
         target_pos = targets[0, :2]
         direction = normalize(target_pos - obj_pos)
 
-        # Sample contour pixels
+        #* Sample contour pixels
         contour_pixels = np.argwhere(obj_contour)
-        sampled = contour_pixels[::stride]   # e.g., stride=5
+        sampled_pixels = sample_pixel_on_farside(contour_pixels, centre_pixel, direction)
 
-        for pixel in sampled:
+        for pixel in sampled_pixels:
             world_xy = pixel_to_world(pixel, K)
             # Run physics probe in Isaac Sim
             score = simulate_poke(isaac_world, obj_name, world_xy, direction)

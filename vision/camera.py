@@ -558,8 +558,8 @@ def render_segmentation_ground_truth(
 def mask_to_contour(
     binary_mask: np.ndarray,
     kernel_size: int = 3,
-) -> np.ndarray:
-    """Extract one-pixel-thick boundary from a binary mask.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract one-pixel-thick boundary and its image-space centre of mass.
 
     contour = mask XOR erode(mask).
 
@@ -571,11 +571,20 @@ def mask_to_contour(
     Returns
     -------
     contour : (H, W) bool.
+    contour_com_pixel : (2,) float32
+        Centre of mass of contour pixels in image coordinates (row, col).
+        If the contour is empty, both values are NaN.
     """
     from scipy.ndimage import binary_erosion
 
     eroded = binary_erosion(binary_mask, iterations=1, structure=np.ones((kernel_size, kernel_size)))
-    return binary_mask & ~eroded
+    contour = binary_mask & ~eroded
+    contour_pixels = np.argwhere(contour)
+    if contour_pixels.size == 0:
+        contour_com_pixel = np.array([np.nan, np.nan], dtype=np.float32)
+    else:
+        contour_com_pixel = contour_pixels.mean(axis=0).astype(np.float32)
+    return contour, contour_com_pixel
 
 
 def segmentation_to_contour_current(
@@ -600,7 +609,8 @@ def segmentation_to_contour_current(
     for obj_id in np.unique(seg):
         if obj_id == 0:
             continue
-        combined |= mask_to_contour(seg == obj_id, kernel_size=kernel_size)
+        contour, _ = mask_to_contour(seg == obj_id, kernel_size=kernel_size)
+        combined |= contour
     return combined.astype(np.float32)
 
 
@@ -647,7 +657,8 @@ def render_goal_contour(
     if not combined.any():
         return np.zeros((H, W), dtype=np.float32)
 
-    return mask_to_contour(combined, kernel_size=kernel_size).astype(np.float32)
+    contour, _ = mask_to_contour(combined, kernel_size=kernel_size)
+    return contour.astype(np.float32)
 
 
 def render_goal_contour_scene(
@@ -680,7 +691,8 @@ def render_goal_contour_scene(
     if not combined.any():
         return np.zeros((H, W), dtype=np.float32)
 
-    return mask_to_contour(combined, kernel_size=kernel_size).astype(np.float32)
+    contour, _ = mask_to_contour(combined, kernel_size=kernel_size)
+    return contour.astype(np.float32)
 
 
 #* ================================================================
