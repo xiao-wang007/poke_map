@@ -45,6 +45,13 @@ finger:
   fingertip_mass_range: [0.02, 0.10]
   default_xyz: [0.0, 0.0, 0.2]
 
+striker:
+  local_path: Striker
+  radius: 0.02
+  default_z: 0.15
+  mass_range: [0.02, 0.10]
+  default_color: [1.0, 0.2, 0.2]
+
 control:
   target_seed: null
   num_control_steps: 120
