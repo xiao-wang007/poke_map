@@ -54,7 +54,7 @@ SCENE_CONFIG = CONFIG["scene"]
 STRIKER_CONFIG = CONFIG["striker"]
 
 ENVS_ROOT_PATH: str = SCENE_CONFIG["envs_root_path"]
-STRIKER_PATTERN: str = f"{ENVS_ROOT_PATH}/env_*/{STRIKER_CONFIG['local_path']}"
+STRIKER_PATTERN: str = f"{ENVS_ROOT_PATH}/env_.*/{STRIKER_CONFIG['local_path']}"
 
 STRIKER_RADIUS: float = STRIKER_CONFIG["radius"]
 STRIKER_DEFAULT_Z: float = STRIKER_CONFIG["default_z"]
@@ -133,8 +133,10 @@ async def strike_async(
     positions = as_numpy(positions).copy()
     positions[env_idx] = [target_xy[0], target_xy[1], safe_z]
     strikers.set_world_poses(positions=positions.tolist())
-    strikers.set_linear_velocities(zero_vel.tolist())
-    strikers.set_angular_velocities(zero_vel.tolist())
+    strikers.set_velocities(
+        linear_velocities=zero_vel.tolist(),
+        angular_velocities=zero_vel.tolist(),
+    )
     await _step_physics(1)
 
     #* -- 2. Descend to contact height ------------------------------------
@@ -154,8 +156,10 @@ async def strike_async(
 
     velocities = np.zeros((num_envs, 3), dtype=np.float32)
     velocities[env_idx] = [vx, vy, 0.0]
-    strikers.set_linear_velocities(velocities.tolist())
-    strikers.set_angular_velocities(zero_vel.tolist())
+    strikers.set_velocities(
+        linear_velocities=velocities.tolist(),
+        angular_velocities=zero_vel.tolist(),
+    )
 
     #* -- 4. Step physics (collision happens here) ------------------------
     await _step_physics(sim_steps)
@@ -168,8 +172,10 @@ async def strike_async(
     #* -- 6. Retract to safe height ---------------------------------------
     final_positions[env_idx, 2] = safe_z
     strikers.set_world_poses(positions=final_positions.tolist())
-    strikers.set_linear_velocities(zero_vel.tolist())
-    strikers.set_angular_velocities(zero_vel.tolist())
+    strikers.set_velocities(
+        linear_velocities=zero_vel.tolist(),
+        angular_velocities=zero_vel.tolist(),
+    )
     await _step_physics(2)
 
     return {
@@ -223,8 +229,10 @@ async def strike_all_async(
     positions[:, 1] = target_xys[:, 1]
     positions[:, 2] = safe_z
     strikers.set_world_poses(positions=positions.tolist())
-    strikers.set_linear_velocities(np.zeros_like(positions).tolist())
-    strikers.set_angular_velocities(np.zeros_like(positions).tolist())
+    strikers.set_velocities(
+        linear_velocities=np.zeros_like(positions).tolist(),
+        angular_velocities=np.zeros_like(positions).tolist(),
+    )
     await _step_physics(1)
 
     #* -- 2. Descend to contact height ------------------------------------
@@ -242,7 +250,7 @@ async def strike_all_async(
     velocities = np.zeros((num_envs, 3), dtype=np.float32)
     velocities[:, 0] = dirs_unit[:, 0] * speeds
     velocities[:, 1] = dirs_unit[:, 1] * speeds
-    strikers.set_linear_velocities(velocities.tolist())
+    strikers.set_velocities(linear_velocities=velocities.tolist())
 
     #* -- 4. Step physics -------------------------------------------------
     await _step_physics(sim_steps)
@@ -253,7 +261,7 @@ async def strike_all_async(
 
     final_positions[:, 2] = safe_z
     strikers.set_world_poses(positions=final_positions.tolist())
-    strikers.set_linear_velocities(np.zeros_like(positions).tolist())
+    strikers.set_velocities(linear_velocities=np.zeros_like(positions).tolist())
     await _step_physics(2)
 
     infos = []

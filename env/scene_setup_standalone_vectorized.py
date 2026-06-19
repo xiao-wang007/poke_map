@@ -99,7 +99,7 @@ STRIKER_DEFAULT_Z: float = STRIKER_CONFIG["default_z"]
 STRIKER_MASS_RANGE: list = STRIKER_CONFIG["mass_range"]
 STRIKER_DEFAULT_COLOR: list = STRIKER_CONFIG["default_color"]
 
-STRIKER_PATTERN: str = f"{ENVS_ROOT_PATH}/env_*/{STRIKER_LOCAL_PATH}"
+STRIKER_PATTERN: str = f"{ENVS_ROOT_PATH}/env_.*/{STRIKER_LOCAL_PATH}"
 
 
 #* ========================================================================
@@ -150,7 +150,7 @@ def create_striker_sphere(
     """Create a standalone rigid-body sphere with collision at *path*.
 
     The sphere is NOT part of any articulation.  It is moved by directly
-    setting ``set_linear_velocities`` and ``set_world_poses`` — no joint
+    setting ``set_velocities`` and ``set_world_poses`` — no joint
     control is needed.  This is the lightweight "proxy striker" for the
     prior and for early RL experiments.
     """
@@ -180,8 +180,11 @@ def create_striker_sphere(
     mass_api.CreateMassAttr(mass)
 
     #* -- Wrap as RigidPrim for velocity / pose control ------------------
-    striker_rb = RigidPrim(paths=path)
-    striker_rb.set_world_poses(positions=[list(position)])
+    striker_rb = RigidPrim(
+        paths=path,
+        positions=[list(position)],
+        reset_xform_op_properties=True,
+    )
 
     return striker_rb
 
@@ -423,8 +426,10 @@ def reset_strikers_to_safe(
     strikers.set_world_poses(positions=positions.tolist())
     #* zero out residual velocity
     zero_vel = np.zeros((num_strikers, 3), dtype=np.float32)
-    strikers.set_linear_velocities(zero_vel.tolist())
-    strikers.set_angular_velocities(zero_vel.tolist())
+    strikers.set_velocities(
+        linear_velocities=zero_vel.tolist(),
+        angular_velocities=zero_vel.tolist(),
+    )
 
 
 def set_striker_velocities(
@@ -436,7 +441,7 @@ def set_striker_velocities(
     To strike in a specific env, set non-zero velocity only for that index.
     Other envs retain zero velocity.
     """
-    strikers.set_linear_velocities(velocities.tolist())
+    strikers.set_velocities(linear_velocities=velocities.tolist())
 
 
 def set_striker_positions(
