@@ -102,6 +102,12 @@ class UNet(nn.Module):
         self.outc = nn.Conv2d(c, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        #! Note: linear output here, no activation, since Q-values should be
+        #! unbounded. 
+        return self.outc(self.get_features(x))     # (B, 1, H, W) return Q-values
+    
+    def get_features(self, x):
         x1 = self.inc(x)        # (B, C, H, W)
         x2 = self.down1(x1)     # (B, 2C, H/2, W/2)
         x3 = self.down2(x2)     # (B, 4C, H/4, W/4)
@@ -110,10 +116,12 @@ class UNet(nn.Module):
         x = self.up2(x4, x3)    # (B, 4C, H/4, W/4)
         x = self.up3(x, x2)     # (B, 2C, H/2, W/2)
         x = self.up4(x, x1)     # (B, C, H, W)
-        return self.outc(x)     # (B, 1, H, W)
+        
+        return x
 
 
-class QNetwork(nn.Module):
+#! Actor-Critic
+class SpatialActorCritic(nn.Module):
     """Q-network wrapper: (B, 2, H, W) → (B, 1, H, W).
 
     Provides forward() to produce Q-values and get_q_values() to extract
@@ -124,9 +132,13 @@ class QNetwork(nn.Module):
         self,
         in_channels: int = 2,
         base_channels: int = 32,
+        delta_d_max: float = 0.2, # 0.2 (m)
     ):
         super().__init__()
         self.unet = UNet(in_channels=in_channels, base_channels=base_channels)
+        self.outc = nn.Conv2d(base_channels, 1, 1) #* Q-head
+        self.param_head = nn.Conv2d(base_channels, 3, 1) #* param-head: (dir_x, dir_y, delta_d)
+        self.delta_d_max = delta_d_max
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Produce per-pixel Q-values.
@@ -138,8 +150,16 @@ class QNetwork(nn.Module):
         Returns
         -------
         Q : (B, 1, H, W) float32 — one Q-value per pixel.
+        Param : (B, 3, H, W) float32 — one set of parameters per pixel.
         """
-        return self.unet(x)
+        f = self.unet.get_features(x)   # (B, C, H, W)
+        q_map = self.outc(f)            # (B, 1, H, W)  no activation
+        params = self.param_head(f)     # (B, 3, H, W)  raw
+
+        d_xy = torch.tanh(params[:, :2]) # (B, 2, H, W) in [-1, 1]
+        delta = torch.sigmoid(params[:, -1]) # (B, H, W) in [0, 1]
+
+        return q_map, torch.cat([d_xy, delta], dim=1)
 
     def get_q_values(
         self,
@@ -160,3 +180,31 @@ class QNetwork(nn.Module):
         q_map = self.forward(x).squeeze(1)  # (B, H, W)
         B = q_map.shape[0]
         return q_map[torch.arange(B), pixel_indices[:, 0], pixel_indices[:, 1]]
+    
+    #TODO: between the network forward pass and before the controller, normalize
+    #TODO: d_xy to ensure unit vector.
+    
+
+
+#! SUMMARY ----------------------------------------------------------------
+#? In the Conv2D, ReLU in the intermediate layers learns nonlinear features.
+#? The final linear layer lets those features to be combined into unbounded
+#? Q-values. Sigmoid would clamp output to 0-1, while a tanh would clamp to 
+#? -1 to 1. We need the network to distinguish a -10 action from a +50 action
+#? when both saturate, i.e. 
+#?   --------------------------------------------------
+#?   Action	    True Q-value	sigmoid(Q)	sigmoid'(Q)
+#?   Terrible   -10	            ≈ 0.000045	≈ 0.000045
+#?   Great	    +50	            ≈ 1.0	    ≈ 0.0
+#?   --------------------------------------------------
+#? both outputs saturate, they hit the flat extremes of the sigmoid curve.
+#? the gradient of the sigmoid at -10 or +50 is essentially zero. The network
+#? cannot push them apart.
+#?
+#?
+#? The param-head follows the same principle: intermediate ReLUs for feature 
+#? learning (inherited from the shared U-net), but the final output deserves
+#? channel-specific constraints. The param-head does need activation because
+#? its outputs are physically constrained quantities: direction components
+#? must live in -1, 1 and standoff distance in 0, Δd_max. The activation 
+#? enforces that domain.
