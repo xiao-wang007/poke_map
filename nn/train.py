@@ -219,11 +219,13 @@ def sample_target_poses(
 
     Returns dict: obj_name → (num_envs, 3)  (z = OBJECT_HEIGHT * 0.5)
     """
-    x = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
-    y = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
     z = np.full((num_envs,), OBJECT_HEIGHT * 0.5, dtype=np.float32)
-    return {"LObject": np.stack([x, y, z], axis=-1),
-            "Cylinder": np.stack([x, y, z], axis=-1)}
+    lx = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
+    ly = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
+    cx = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
+    cy = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
+    return {"LObject":  np.stack([lx, ly, z], axis=-1),
+            "Cylinder": np.stack([cx, cy, z], axis=-1)}
 
 
 #* ================================================================
@@ -354,59 +356,80 @@ async def env_step_async(
 ) -> tuple[dict, np.ndarray]:
     """Execute strikes with the prismatic XYZ finger robot.
 
-    Phases: position at standoff → strike (velocity-controlled) → settle.
-    Approach/descent/retract are offloaded to a trajectory optimisation policy.
+    Phases:
+      0. lift to safe height above current XY
+      1. move to standoff_xy at safe height (collision-free)
+      2. descend to standoff_xy at object height
+      3. strike — push OVERTRAVEL past contact with velocity
+      4. retract to safe height
+      5. settle objects
     """
     B = len(fingers)
     dof_indices = fingers.get_dof_indices(fingers.dof_names)
 
-    #* ── convert pixel → world XY + strike speeds ──────────────────
+    #* ── convert pixel → world XY ───────────────────────────────────
     world_xy = np.zeros((B, 2), dtype=np.float32)
-    speeds = np.zeros(B, dtype=np.float32)
     for b in range(B):
         w = pixel_to_world(tuple(pixel_ij[b]), K)
         world_xy[b] = w[:2]
-        speeds[b] = np.sqrt(2.0 * A_MAX * delta_d[b])  # g(Δd)
 
-    #* ── normalise direction ───────────────────────────────────────
+    #* ── normalise direction ────────────────────────────────────────
     dir_norm = np.linalg.norm(d_xy, axis=1, keepdims=True)
     dir_norm = np.where(dir_norm < 1e-8, 1.0, dir_norm)
     dirs = d_xy / dir_norm
 
     zero_v = np.zeros((B, 3), dtype=np.float32)
 
-    #* standoff: start delta_d behind contact point so finger has
-    #* room to accelerate before impact
+    #* ── standoff & speed from Δd ────────────────────────────────────
     delta_d_clipped = np.clip(delta_d, 0.001, DELTA_D_MAX)
-    standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2)
+    speeds = np.sqrt(2.0 * A_MAX * delta_d_clipped)          # g(Δd)
+    standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up
 
-    #* ── Phase 1: position at standoff, object height ─────────────
-    #*    approach/descent handled by trajectory optimisation policy
+    #* ── Phase 0: lift to safe height above current position ─────────
+    q_cur = as_numpy(fingers.get_dof_positions()).copy()     # (B, 3)
+    q0 = q_cur.copy()
+    q0[:, 2] = SAFE_Z
+    fingers.set_dof_position_targets(positions=q0.tolist(), dof_indices=dof_indices)
+    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
+    await _step_physics(20)
+
+    #* ── Phase 1: move to standoff at safe height (above objects) ───
     q1 = np.zeros((B, 3), dtype=np.float32)
     q1[:, 0] = standoff_xy[:, 0]
     q1[:, 1] = standoff_xy[:, 1]
-    q1[:, 2] = OBJECT_HEIGHT
+    q1[:, 2] = SAFE_Z
     fingers.set_dof_position_targets(positions=q1.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(20)   # let PD converge at standoff
+    await _step_physics(30)
 
-    #* ── Phase 2: strike — accelerate through delta_d then push
-    #*    OVERTRAVEL past contact ──────────────────────────────────
-    q2 = np.zeros((B, 3), dtype=np.float32)
-    q2[:, 0] = world_xy[:, 0] + dirs[:, 0] * OVERTRAVEL
-    q2[:, 1] = world_xy[:, 1] + dirs[:, 1] * OVERTRAVEL
+    #* ── Phase 2: descend to standoff at object height ───────────────
+    q2 = q1.copy()
     q2[:, 2] = OBJECT_HEIGHT
-
-    v2 = np.zeros((B, 3), dtype=np.float32)
-    v2[:, 0] = dirs[:, 0] * speeds
-    v2[:, 1] = dirs[:, 1] * speeds
-
     fingers.set_dof_position_targets(positions=q2.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=v2.tolist(), dof_indices=dof_indices)
+    await _step_physics(15)
+
+    #* ── Phase 3: strike — push OVERTRAVEL past contact ──────────────
+    q3 = np.zeros((B, 3), dtype=np.float32)
+    q3[:, 0] = world_xy[:, 0] + dirs[:, 0] * OVERTRAVEL
+    q3[:, 1] = world_xy[:, 1] + dirs[:, 1] * OVERTRAVEL
+    q3[:, 2] = OBJECT_HEIGHT
+
+    v3 = np.zeros((B, 3), dtype=np.float32)
+    v3[:, 0] = dirs[:, 0] * speeds
+    v3[:, 1] = dirs[:, 1] * speeds
+
+    fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
+    fingers.set_dof_velocity_targets(velocities=v3.tolist(), dof_indices=dof_indices)
     await _step_physics(IMPACT_STEPS)
 
-    #* ── Phase 3: settle objects — wait until all stopped ─────────
-    VEL_THRESH = 0.005   # m/s
+    #* ── Phase 4: retract to safe height ─────────────────────────────
+    q4 = q3.copy()
+    q4[:, 2] = SAFE_Z
+    fingers.set_dof_position_targets(positions=q4.tolist(), dof_indices=dof_indices)
+    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
+    await _step_physics(15)
+
+    #* ── Phase 5: settle objects — wait until all stopped ────────────
+    VEL_THRESH = 0.005
     MAX_SETTLE = 100
     l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
     cyl_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
@@ -419,7 +442,7 @@ async def env_step_async(
             bool(np.all(np.linalg.norm(cv, axis=1) < VEL_THRESH))):
             break
 
-    #* ── query new object poses ───────────────────────────────────
+    #* ── query new object poses ─────────────────────────────────────
     poses, env_root_pos = get_object_poses_vectorized()
     return poses, env_root_pos
 
@@ -507,8 +530,8 @@ def train_step(
     params_actor_at = actor_critic.params_at_pixel(params_act, pixel)  # (B, 3)
 
     #* FiLM from actor params (GRADS flow through film MLPs → param_head)
-    gamma, beta = actor_critic.film(params_actor_at)
-    f_mod_pg = gamma[:, :, None, None] * f_detached + beta[:, :, None, None]
+    film_gamma, film_beta = actor_critic.film(params_actor_at)
+    f_mod_pg = film_gamma[:, :, None, None] * f_detached + film_beta[:, :, None, None]
     q_map_pg = actor_critic.q_head(f_mod_pg)   # q_head frozen, just forward
     q_val_pg = q_map_pg[batch_idx, 0, pixel[:, 0], pixel[:, 1]]  # (B,)
 
@@ -516,7 +539,12 @@ def train_step(
 
     optimizer_mu.zero_grad()
     L_mu.backward()
-    torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 10.0)
+
+    #!clip_grad_norm_ scoped to _mu_params only (lines 519-521) Only clips film 
+    #! + param_head params, not the stale gradients on frozen q_head/unet. Correct fix.
+    _mu_params = list(actor_critic.param_head.parameters()) + \
+                 list(actor_critic.film.parameters())
+    torch.nn.utils.clip_grad_norm_(_mu_params, 10.0)
     optimizer_mu.step()
 
     #* unfreeze
@@ -592,6 +620,14 @@ class Trainer:
             seed=None,
         )
         step_physics(SCENE_CONFIG["settle_steps"])
+
+        #* ── reposition finger at object level (centre of each env) ──
+        dof_idx = self.fingers.get_dof_indices(self.fingers.dof_names)
+        init_pos = np.tile([0.0, 0.0, SAFE_Z], (NUM_ENVS, 1)).astype(np.float32)
+        init_vel = np.zeros((NUM_ENVS, 3), dtype=np.float32)
+        self.fingers.set_dof_position_targets(positions=init_pos.tolist(), dof_indices=dof_idx)
+        self.fingers.set_dof_velocity_targets(velocities=init_vel.tolist(), dof_indices=dof_idx)
+        step_physics(30)  # let PD converge to centre
 
         # random targets
         targets_pos = sample_target_poses(self.rng, NUM_ENVS)
@@ -714,3 +750,32 @@ def main(num_episodes: int = 10_000):
 
 if __name__ == "__main__":
     trainer = main()
+
+
+
+
+
+#* You're right — the current code has a collision risk. The finger moves in 
+#* a straight line to standoff_xy at OBJECT_HEIGHT. If the standoff is on 
+#* the far side of the object from the finger's current position, 
+#* the straight-line path passes through the object.
+
+#* The fix: lift before approach
+#* Restore a minimal height staging — 2 extra lines, no heuristic needed:
+#* Phase 0:  q = (current_xy, SAFE_Z)           ← lift above objects (~0.1s)
+#* Phase 1:  q = (standoff_xy, SAFE_Z)          ← move above, no collision risk
+#* Phase 2:  q = (standoff_xy, OBJECT_HEIGHT)    ← descend at standoff
+#* Phase 3:  q = (world_xy + overtravel·d̂, OBJECT_HEIGHT)  ← strike
+#*           v = d̂·speed
+#* Phase 4:  settle objects
+#* The key: horizontal movement happens at SAFE_Z (above all objects). The 
+#* finger is only at OBJECT_HEIGHT during the strike, when it's already 
+#* at the correct standoff position.
+
+#TODOs:
+#* Heuristic reset: not needed for correctness, useful for speed
+#* You could bias object placement so the finger's default position is 
+#* already on the correct side — this would save the Phase 0-1 overhead per 
+#* step (about 15-20 physics frames). But this is a training-speed optimization,
+#* not a correctness fix. Start with the lift approach; add heuristic reset 
+#* later if the overhead is too high.
