@@ -1,0 +1,223 @@
+ OPTION B: DPG with FiLM-conditioned Q-head
+                          ===========================================
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                         FORWARD PASS (one step)
+═══════════════════════════════════════════════════════════════════════════════
+
+   Scene observation
+         │
+   x = contour_current + contour_goal    (B, 2, H, W)
+         │
+         ▼
+   ┌─────────────┐
+   │  Shared      │
+   │  U-Net       │  ← ReLU activations inside, no activation at output
+   │  encoder     │
+   └──────┬──────┘
+          │
+          │  f  (B, 32, H, W)   ← shared feature map
+          │
+    ┌─────┴─────────┐
+    │               │
+    ▼               ▼
+┌──────────┐   ┌──────────────┐
+│ param-head │   │  FiLM MLP     │
+│ Conv(32,3) │   │               │
+│            │   │ params (B,3)  │──▶ MLP_γ(3→32) ──▶ γ (B,32)
+│ output:   │   │  = (d̂,d̂,Δd)  │
+│ raw params│   │               │──▶ MLP_β(3→32) ──▶ β (B,32)
+│ (B,3,H,W) │   └──────┬────────┘
+└─────┬──────┘          │
+      │                 │
+      │            γ, β (B,32) each
+      │                 │
+      │    ┌────────────┘
+      │    │
+      │    ▼
+      │  f_mod = γ·f + β    (B, 32, H, W)   ← actions modulate features
+      │    │
+      │    ▼
+      │  Q-head
+      │  Conv(32, 1)
+      │    │
+      │    ▼
+      │  Q-map (B, 1, H, W)   ← Q(s, pixel, a)  evaluates full action
+      │
+      ▼
+   params (B, 3, H, W)        ← (d̂_x, d̂_y, Δd) per pixel
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                         ACTION SELECTION (same step)
+═══════════════════════════════════════════════════════════════════════════════
+
+   Q-map (B, 1, H, W)              params (B, 3, H, W)
+           │                              │
+           ▼                              │
+   mask non-contour → -∞                  │
+   ε-greedy pixel*                        │
+           │                              │
+           ▼                              ▼
+   pixel* = argmax Q                params* = params[批号, :, pixel*.row, pixel*.col]
+           │                              │   (B, 3)  — raw values
+           │                              │
+           │                    ┌─────────┘
+           │                    ▼
+           │              d̂_raw = tanh(params*[:, :2])   (B,2) in [-1,1]
+           │              Δd    = sigmoid(params*[:, 2]) * Δd_max  (B,) in [0, Δd_max]
+           │              d̂     = d̂_raw / ||d̂_raw||      ← unit normalize
+           │              + Gaussian exploration noise on (d̂, Δd)
+           │                    │
+           └────────┬───────────┘
+                    ▼
+            action = (pixel*, d̂, Δd)
+                    │
+                    ▼
+            execute_strike_all()
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                         ENVIRONMENT & STORAGE
+═══════════════════════════════════════════════════════════════════════════════
+
+   strike_all(strikers, world_xy, d̂, speed=g(Δd))
+         │
+         ▼
+   new poses → compute r, done
+         │
+         ▼
+   new contours → x_next
+         │
+         ▼
+   store (x, pixel*, d̂, Δd, r, x_next, done, contour_mask) in replay buffer
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                         TRAINING STEP (after N env steps)
+═══════════════════════════════════════════════════════════════════════════════
+
+   Sample minibatch from replay buffer: (x, pixel*, d̂, Δd, r, x_next, done)
+
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                        LOSS 1: Q-Loss (TD)                           │
+   │                                                                      │
+   │  # Forward pass through target network (NO gradient)                  │
+   │  with torch.no_grad():                                               │
+   │      f_next = target_net.unet(x_next)                                │
+   │      params_next = target_net.param_head(f_next)                    │
+   │      params_next_act = (tanh, sigmoid, normalize as during action)  │
+   │      f_next_mod = FiLM(f_next, params_next_act)  ← γ,β from target  │
+   │      q_next = target_net.q_head(f_next_mod)  ← target Q-map         │
+   │      q_next[~mask] = -inf                                           │
+   │      pixel_next* = argmax q_next                                    │
+   │      q_max_next = q_next[arange, 0, pixel_next*]                    │
+   │                                                                      │
+   │  target = r + γ * q_max_next * (1 - done)                            │
+   │                                                                      │
+   │  # Forward pass through online network (WITH gradient)               │
+   │  f_online = actor_critic.unet(x)                                    │
+   │  params_online = actor_critic.param_head(f_online)                  │
+   │  params_online_act = (tanh, sigmoid, normalize)                     │
+   │  f_mod = FiLM(f_online, params_online_act)                          │
+   │  q_map = actor_critic.q_head(f_mod)                                 │
+   │  q_val = q_map[arange, 0, pixel*.row, pixel*.col]                   │
+   │                                                                      │
+   │  L_Q = Huber(q_val, target)                                          │
+   │  L_Q.backward()          ← updates: Q-head, FiLM MLPs, shared encoder│
+   │  optimizer_Q.step()      ← param-head NOT updated (no grad path)    │
+   │                                                                      │
+   │  Gradient flow:                                                      │
+   │    L_Q → q_val → q_head(Conv) → FiLM(γ,β) → shared UNet            │
+   │                  ↑                                                   │
+   │            FiLM MLPs also get grad                                   │
+   └─────────────────────────────────────────────────────────────────────┘
+
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                 LOSS 2: Policy Gradient (DPG)                         │
+   │                                                                      │
+   │  # FREEZE Q-head + FiLM MLP parameters (they are the critic)         │
+   │  for p in actor_critic.q_head.parameters():     p.requires_grad=False│
+   │  for p in actor_critic.mlp_gamma.parameters(): p.requires_grad=False│
+   │  for p in actor_critic.mlp_beta.parameters():  p.requires_grad=False│
+   │                                                                      │
+   │  # Use SAME online features (no re-compute needed)                  │
+   │  L_μ = -q_val          ← negative Q-value at the selected pixel      │
+   │                           with the params that were output there     │
+   │  L_μ.backward()        ← updates: param-head ONLY                   │
+   │  optimizer_μ.step()                                                  │
+   │                                                                      │
+   │  Gradient flow:                                                      │
+   │    L_μ → q_val → q_head(frozen) → FiLM(frozen) → f_online(frozen)   │
+   │           \                                                          │
+   │            params_online (has grad!) → param_head (updated!)        │
+   │                                                                      │
+   │  # UNFREEZE                                                          │
+   │  for p in actor_critic.q_head.parameters():     p.requires_grad=True │
+   │  for p in actor_critic.mlp_gamma.parameters(): p.requires_grad=True │
+   │  for p in actor_critic.mlp_beta.parameters():  p.requires_grad=True │
+   └─────────────────────────────────────────────────────────────────────┘
+
+   # Soft-update target network every C steps:
+   #   θ_target ← τ·θ_online + (1-τ)·θ_target
+```
+
+---
+
+## Key: why the gradient flows the way it does in DPG
+
+```
+L_μ = - Q(s, pixel*, μ(s)[pixel*])
+        │           │
+        │           └── the action came from param-head
+        │               = params_online at that pixel
+        │
+        └── Q-value is computed through f_mod = γ·f + β
+            f depends on shared encoder (FROZEN)
+            γ,β depend on params (FROZEN for this loss)
+
+Chain rule:
+  ∂L_μ/∂θ_param_head = ∂(-Q)/∂params_online × ∂params_online/∂θ_param_head
+
+  ∂(-Q)/∂params_online:
+    Q-head takes f_mod as input, where f_mod = γ·f + β
+    and γ = MLP_γ(params), β = MLP_β(params)
+    So: ∂Q/∂params = ∂Q/∂f_mod · (∂γ/∂params · f + ∂β/∂params)
+    But since γ,β MLPs are FROZEN, this gradient path is cut
+    WAIT — this breaks!
+
+Actually, this is the problem: if FiLM MLPs are frozen, the gradient from Q
+to params is blocked. Here's the fix:
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  OPTION: for DPG, recompute f_mod allowing params to have    │
+  │  gradient, but DETACH f (the shared encoder output)          │
+  │                                                               │
+  │  f_detached = f_online.detach()       ← no grad to encoder   │
+  │  γ, β = FiLM_MLPs(params_online)      ← MLPs require_grad   │
+  │  f_mod_pg = γ * f_detached + β        ← params have path    │
+  │  q_map_pg = q_head(frozen)(f_mod_pg)  ← q_head frozen       │
+  │  L_μ = - q_map_pg[arange, 0, pixel*]                         │
+  │                                                               │
+  │  Gradient:  L_μ → q_head(frozen) → f_mod_pg                │
+  │                → FiLM_MLPs(UPDATED) → params_online(UPDATED) │
+  │                → param_head(UPDATED)                          │
+  │                                                               │
+  │  encoder NOT updated (detached f) → correct, only actor      │
+  │  FiLM MLPs ARE updated (required_grad) → also actors         │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+## Summary of which parameters each loss updates
+
+```
+                    Shared     FiLM       Q-head      Param-
+                    Encoder    MLPs       Conv(32,1)   head
+Loss 1 (Q-loss)      ✓          ✓          ✓           ✗
+Loss 2 (DPG)         ✗          ✓          ✗           ✓
+```
+
+The FiLM MLPs are like a "bridge" — trained by both losses, mediating between action params 
+and Q-values. This is standard in actor-critic: the critic learns to evaluate, the actor 
+learns to improve, and the interface between them adapts.
