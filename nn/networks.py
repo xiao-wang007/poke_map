@@ -188,13 +188,18 @@ class SpatialActorCritic(nn.Module):
     #* -- forward -------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Full forward pass; FiLM uses spatially-pooled params."""
+        """Full forward pass; FiLM uses contour-masked spatial mean of params."""
         f = self.unet.get_features(x)              # (B, C, H, W)
         params_raw = self.param_head(f)            # (B, 3, H, W)
         params = self._activate_params(params_raw) # (B, 3, H, W)
 
-        #* spatial mean → per-sample conditioning
-        params_global = params.mean(dim=[-2, -1])  # (B, 3)
+        #! The argmax pixel is still selected via the cheap mean-conditioned 
+        #! Q (a heuristic), then re-evaluated with specific-param conditioning 
+        #! for the actual target value. 
+        # contour-masked mean — only object pixels contribute to FiLM
+        contour_mask = (x[:, 0:1] > 0.0).float()   # (B, 1, H, W)
+        counts = contour_mask.sum(dim=[-2, -1]).clamp(min=1)  # (B, 1)
+        params_global = (params * contour_mask).sum(dim=[-2, -1]) / counts  # (B, 3)
         gamma, beta = self.film(params_global)
         f_mod = gamma[:, :, None, None] * f + beta[:, :, None, None]
         q_map = self.q_head(f_mod)                 # (B, 1, H, W)
@@ -256,3 +261,6 @@ class SpatialActorCritic(nn.Module):
 #?
 #? γ and β are produced by a tiny MLP (3 → 32 → 32 neurons, ~2K parameters). 
 #? They scale and shift each of the 32 feature channels based on the action params.
+
+
+

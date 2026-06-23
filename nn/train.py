@@ -54,6 +54,7 @@ from vision.camera import (
 )
 from nn.networks import SpatialActorCritic
 from env.make_finger_robot import LIMIT_LOWER, LIMIT_UPPER, configure_drives
+from env.scene_setup_articulated_vectorized import randomize_object_poses
 
 CONFIG = load_config()
 SCENE_CONFIG = CONFIG["scene"]
@@ -62,7 +63,7 @@ FINGER_CONFIG = CONFIG["finger"]
 OBJECT_HEIGHT = SCENE_CONFIG["object_height"]
 ENVS_ROOT_PATH = SCENE_CONFIG["envs_root_path"]
 FINGER_LOCAL_PATH = FINGER_CONFIG["local_root_path"]
-FINGER_ROOT_PATTERN = f"{ENVS_ROOT_PATH}/env_*/{FINGER_LOCAL_PATH}"
+FINGER_ROOT_PATTERN = f"{ENVS_ROOT_PATH}/env_.*/{FINGER_LOCAL_PATH}"
 FINGER_TIP_PATTERN = f"{FINGER_ROOT_PATTERN}/z_link"
 NUM_ENVS = SCENE_CONFIG["num_envs"]
 
@@ -74,7 +75,7 @@ NUM_ENVS = SCENE_CONFIG["num_envs"]
 GAMMA: float = 0.95
 LR: float = 3e-4
 BATCH_SIZE: int = 64
-BUFFER_CAPACITY: int = 100_000
+BUFFER_CAPACITY: int = 25_000
 EPS_START: float = 1.0
 EPS_END: float = 0.05
 EPS_DECAY: int = 2_000           # episodes over which ε decays
@@ -85,7 +86,6 @@ MAX_STEPS: int = 30              # max pokes per episode
 C_STEP: float = 0.01             # per-step penalty
 C_SUCCESS: float = 10.0          # terminal success bonus
 SUCCESS_THRESHOLD: float = 0.02  # metres — tolerance to target
-A_MAX: float = 8.0               # max finger acceleration (m/s²) 13 m/s² for panda ee
 DELTA_D_MAX: float = 0.2          # max standoff (m)
 IMPACT_STEPS: int = 40            # physics steps per strike (k_p=200, m≈2 kg)
 OVERTRAVEL: float = 0.05          # finger pushes this far past contact (m)
@@ -111,6 +111,8 @@ class ReplayBuffer:
     """Ring buffer storing per-transition data (one env, one step).
 
     Each element is a flat dict so we can mix across envs and episodes.
+    x / x_next are stored as uint8 (binary contours) to save memory.
+    Mask is reconstructed on-the-fly from x in sample() / train_step().
     """
 
     def __init__(self, capacity: int = BUFFER_CAPACITY, device: str = DEVICE):
@@ -118,57 +120,55 @@ class ReplayBuffer:
         self.device = device
 
         H, W = RESOLUTION
-        self.x      = torch.zeros(capacity, 2, H, W)
-        self.pixel  = torch.zeros(capacity, 2, dtype=torch.long)  # (row, col)
-        self.d_xy   = torch.zeros(capacity, 2)                     # unit direction
-        self.delta_d = torch.zeros(capacity, 1)                    # standoff
-        self.r      = torch.zeros(capacity, 1)
-        self.x_next = torch.zeros(capacity, 2, H, W)
-        self.done   = torch.zeros(capacity, 1, dtype=torch.bool)
-        self.mask   = torch.zeros(capacity, H, W, dtype=torch.bool)       # contour
-        self.mask_next = torch.zeros(capacity, H, W, dtype=torch.bool)
+        self.x        = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
+        self.pixel    = torch.zeros(capacity, 2, dtype=torch.long)
+        self.d_xy     = torch.zeros(capacity, 2)
+        self.delta_d  = torch.zeros(capacity, 1)
+        self.r        = torch.zeros(capacity, 1)
+        self.x_next   = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
+        self.done     = torch.zeros(capacity, 1, dtype=torch.bool)
 
         self.ptr = 0
         self.size = 0
 
     def push(
         self,
-        x: torch.Tensor,             # (1, 2, H, W)
+        x: torch.Tensor,             # (1, 2, H, W) float32 binary contours
         pixel_ij: np.ndarray,        # (2,) int
         d_xy: np.ndarray,            # (2,)
         delta_d: float,
         reward: float,
-        x_next: torch.Tensor,        # (1, 2, H, W)
+        x_next: torch.Tensor,        # (1, 2, H, W) float32
         done: bool,
-        mask: np.ndarray,            # (H, W) bool
-        mask_next: np.ndarray,       # (H, W) bool
     ):
         idx = self.ptr
-        self.x[idx].copy_(x.cpu() if x.device.type != "cpu" else x)
+        # float32 → uint8 (binary 0/1 contours)
+        _x = (x.squeeze(0) * 255).to(torch.uint8)
+        _xn = (x_next.squeeze(0) * 255).to(torch.uint8)
+        self.x[idx].copy_(_x.cpu() if _x.device.type != "cpu" else _x)
         self.pixel[idx] = torch.tensor(pixel_ij)
         self.d_xy[idx] = torch.tensor(d_xy)
         self.delta_d[idx] = torch.tensor([delta_d])
         self.r[idx] = torch.tensor([reward])
-        self.x_next[idx].copy_(x_next.cpu() if x_next.device.type != "cpu" else x_next)
+        self.x_next[idx].copy_(_xn.cpu() if _xn.device.type != "cpu" else _xn)
         self.done[idx] = torch.tensor([done])
-        self.mask[idx] = torch.tensor(mask)
-        self.mask_next[idx] = torch.tensor(mask_next)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
         indices = torch.randint(0, self.size, (batch_size,))
+        x      = self.x[indices].to(torch.float32).to(self.device)
+        x_next = self.x_next[indices].to(torch.float32).to(self.device)
         return {
-            "x":         self.x[indices].to(self.device),
+            "x":         x,
             "pixel":     self.pixel[indices].to(self.device),
             "d_xy":      self.d_xy[indices].to(self.device),
             "delta_d":   self.delta_d[indices].to(self.device),
             "r":         self.r[indices].to(self.device),
-            "x_next":    self.x_next[indices].to(self.device),
+            "x_next":    x_next,
             "done":      self.done[indices].to(self.device),
-            "mask":      self.mask[indices].to(self.device),
-            "mask_next": self.mask_next[indices].to(self.device),
+            "mask_next": x_next[:, 0] > 0,          # derived from channel 0
         }
 
     def __len__(self) -> int:
@@ -189,15 +189,14 @@ async def _step_physics(steps: int):
     await app_utils.update_app_async(steps=steps)
 
 
-def step_physics(steps: int = 1):
-    run_coroutine(_step_physics(steps))
-
-
-def ensure_sim_running():
+async def ensure_sim_running_async():
     app_utils.play()
-    step_physics(1)
+    await _step_physics(1)
 
 
+
+#! this gets the handles to all parallel envs, given my vectorized envs are
+#! setup in the other script.
 def get_finger_handles() -> tuple[Articulation, RigidPrim, XformPrim]:
     """Return finger articulations, tip links, and env roots."""
     fingers = Articulation(paths=FINGER_ROOT_PATTERN)
@@ -292,34 +291,16 @@ def select_action(
     return pixel_ij, d_xy_arr, delta_d_arr
 
 
-#* ================================================================
-#*  Contour mask extraction
-#* ================================================================
-
-def extract_contour_masks(seg_maps: list[np.ndarray]) -> torch.Tensor:
-    """Build binary contour masks from instance segmentation maps."""
-    from scipy.ndimage import binary_erosion
-    B = len(seg_maps)
-    H, W = seg_maps[0].shape
-    masks = np.zeros((B, H, W), dtype=bool)
-    for b, seg in enumerate(seg_maps):
-        for oid in np.unique(seg):
-            if oid == 0:
-                continue
-            obj_mask = seg == oid
-            eroded = binary_erosion(obj_mask, iterations=1)
-            masks[b] |= obj_mask & ~eroded
-    return torch.tensor(masks, dtype=torch.bool)
-
 
 #* ================================================================
 #*  Reward & termination
 #* ================================================================
 
 def compute_rewards(
-    poses_before: dict,         # obj_name → (N_envs, 3)
+    poses_before: dict,         # obj_name → (positions, quaternions) in world coords
     poses_after: dict,
-    targets: dict,              # obj_name → (N_envs, 3)
+    targets: dict,              # obj_name → (N_envs, 3)  in env-local coords
+    env_root_pos: np.ndarray | None = None,  # (N_envs, 3)  world position of each env root
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-env reward + done flag.
 
@@ -328,13 +309,19 @@ def compute_rewards(
 
     r = Σ max(0, d_before - d_after) - c_step  (+ c_success if all at target)
     """
-    num_envs = list(poses_before.values())[0].shape[0]
+    num_envs = list(poses_before.values())[0][0].shape[0]
     r = np.zeros(num_envs, dtype=np.float32)
     done = np.ones(num_envs, dtype=bool)
 
+    offset = env_root_pos[:, :2] if env_root_pos is not None else np.zeros((num_envs, 2))
+
     for obj_name in poses_before:
-        d_before = np.linalg.norm(poses_before[obj_name][:, :2] - targets[obj_name][:, :2], axis=1)
-        d_after  = np.linalg.norm(poses_after[obj_name][:, :2] - targets[obj_name][:, :2], axis=1)
+        pos_before = poses_before[obj_name][0].copy()
+        pos_after  = poses_after[obj_name][0].copy()
+        pos_before[:, :2] -= offset           # world → env-local
+        pos_after[:, :2]  -= offset
+        d_before = np.linalg.norm(pos_before[:, :2] - targets[obj_name][:, :2], axis=1)
+        d_after  = np.linalg.norm(pos_after[:, :2] - targets[obj_name][:, :2], axis=1)
         r += np.maximum(0.0, d_before - d_after)
         done &= (d_after < SUCCESS_THRESHOLD)
 
@@ -380,10 +367,8 @@ async def env_step_async(
 
     zero_v = np.zeros((B, 3), dtype=np.float32)
 
-    #* ── standoff & speed from Δd ────────────────────────────────────
+    #* ── standoff from Δd ────────────────────────────────────────────
     delta_d_clipped = np.clip(delta_d, 0.001, DELTA_D_MAX)
-    speeds = np.sqrt(2.0 * A_MAX * delta_d_clipped)          # g(Δd)
-    speeds = np.clip(speeds, 0.0, 2.0)                       # respect real EE limit
     standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up
 
     #* ── Phase 0: lift to safe height above current position ─────────
@@ -409,17 +394,16 @@ async def env_step_async(
     await _step_physics(20)
 
     #* ── Phase 3: strike — push OVERTRAVEL past contact ──────────────
+    #* Position-only PD (v_target=0) — OVERTRAVEL creates a steady
+    #* pushing force kp*OVERTRAVEL.  No velocity target avoids oscillation
+    #* at the contact point (velocity tracking fights the constraint).
     q3 = np.zeros((B, 3), dtype=np.float32)
     q3[:, 0] = world_xy[:, 0] + dirs[:, 0] * OVERTRAVEL
     q3[:, 1] = world_xy[:, 1] + dirs[:, 1] * OVERTRAVEL
     q3[:, 2] = OBJECT_HEIGHT
 
-    v3 = np.zeros((B, 3), dtype=np.float32)
-    v3[:, 0] = dirs[:, 0] * speeds
-    v3[:, 1] = dirs[:, 1] * speeds
-
     fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=v3.tolist(), dof_indices=dof_indices)
+    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
     await _step_physics(IMPACT_STEPS)
 
     #* ── Phase 4: retract to safe height ─────────────────────────────
@@ -448,16 +432,6 @@ async def env_step_async(
     return poses, env_root_pos
 
 
-def env_step(
-    fingers: Articulation,
-    pixel_ij: np.ndarray,
-    d_xy: np.ndarray,
-    delta_d: np.ndarray,
-    K: np.ndarray,
-) -> tuple[dict, np.ndarray]:
-    return run_coroutine(env_step_async(fingers, pixel_ij, d_xy, delta_d, K))
-
-
 #* ================================================================
 #*  Training step
 #* ================================================================
@@ -478,7 +452,7 @@ def train_step(
     r       = batch["r"]           # (B, 1)
     x_next  = batch["x_next"]
     done    = batch["done"]        # (B, 1)
-    mask_next = batch["mask_next"]  # (B, H, W)
+    mask_next = batch["mask_next"]  # (B, H, W) — pre-computed in sample()
 
     B = x.shape[0]
     batch_idx = torch.arange(B, device=x.device)
@@ -492,14 +466,23 @@ def train_step(
     #*  LOSS 1 — Q-Loss (Huber TD)
     #* =================================================================
 
-    #* target Q-value
+    #* target Q-value — conditioned on the specific next-action params
+    #! The argmax pixel is still selected via the cheap mean-conditioned 
+    #! Q (a heuristic), then re-evaluated with specific-param conditioning 
+    #! for the actual target value. 
     with torch.no_grad():
         q_next, params_next = target_net(x_next)
         q_next_sq = q_next.squeeze(1)
         q_next_sq[~mask_next] = -float("inf")
-        pixel_next = q_next_sq.view(B, -1).argmax(dim=1)
-        q_max_next = q_next_sq[batch_idx, pixel_next // q_next.shape[-1],
-                               pixel_next % q_next.shape[-1]]
+        pixel_next_flat = q_next_sq.view(B, -1).argmax(dim=1)
+        pixel_next = torch.stack([pixel_next_flat // q_next.shape[-1],
+                                  pixel_next_flat % q_next.shape[-1]], dim=1)
+
+        # Q(s', pixel', params_at_pixel') — consistent with online Q definition
+        params_next_at = target_net.params_at_pixel(params_next, pixel_next)
+        q_map_next = target_net.q_map_with_params(x_next, params_next_at)
+        q_max_next = q_map_next[batch_idx, 0, pixel_next[:, 0], pixel_next[:, 1]]
+
         target = r.squeeze() + gamma * q_max_next * (~done.squeeze())
 
     #* online Q with stored action
@@ -574,12 +557,6 @@ class Trainer:
     """Orchestrates the training loop inside the Isaac Sim Script Editor."""
 
     def __init__(self):
-        ensure_sim_running()
-
-        self.fingers, self.tips, self.env_roots = get_finger_handles()
-        configure_drives(self.fingers)
-        self.K = get_camera_intrinsics()
-
         self.actor_critic = SpatialActorCritic(delta_d_max=DELTA_D_MAX).to(DEVICE)
         self.target_net   = SpatialActorCritic(delta_d_max=DELTA_D_MAX).to(DEVICE)
         soft_update(self.target_net, self.actor_critic, tau=1.0)  # copy
@@ -604,23 +581,31 @@ class Trainer:
         self.ep_returns: deque[float] = deque(maxlen=100)
         self.ep_lengths: deque[int]   = deque(maxlen=100)
 
+    async def setup(self):
+        """Async init — starts sim, gets handles, configures drives."""
+        await ensure_sim_running_async()
+        self.fingers, self.tips, self.env_roots = get_finger_handles()
+        configure_drives(self.fingers)
+        self.K = get_camera_intrinsics()
+
     def _decay_schedule(self, episode: int):
         frac = min(1.0, episode / EPS_DECAY)
         self.epsilon  = EPS_START + (EPS_END - EPS_START) * frac
         self.noise_std = SIGMA_START + (SIGMA_END - SIGMA_START) * frac
 
-    def _reset_episode(self) -> tuple[torch.Tensor, list, torch.Tensor, dict]:
+
+    #! Reset 
+    async def _reset_episode(self) -> tuple[torch.Tensor, list, torch.Tensor, dict]:
         """Randomise objects + targets, return first observation."""
         #* RigidPrim handles (use same patterns as scene setup)
         l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
         cylinder_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
 
-        from env.scene_setup_articulated_vectorized import randomize_object_poses
         randomize_object_poses(
             self.env_roots, l_objects, cylinder_objects,
             seed=None,
         )
-        step_physics(SCENE_CONFIG["settle_steps"])
+        await _step_physics(SCENE_CONFIG["settle_steps"])
 
         #* ── reposition finger at object level (centre of each env) ──
         dof_idx = self.fingers.get_dof_indices(self.fingers.dof_names)
@@ -628,7 +613,7 @@ class Trainer:
         init_vel = np.zeros((NUM_ENVS, 3), dtype=np.float32)
         self.fingers.set_dof_position_targets(positions=init_pos.tolist(), dof_indices=dof_idx)
         self.fingers.set_dof_velocity_targets(velocities=init_vel.tolist(), dof_indices=dof_idx)
-        step_physics(30)  # let PD converge to centre
+        await _step_physics(30)  # let PD converge to centre
 
         # random targets
         targets_pos = sample_target_poses(self.rng, NUM_ENVS)
@@ -643,7 +628,7 @@ class Trainer:
             poses_before, targets_pos, targets_ori, self.K,
             env_root_pos=env_root_pos,
         )
-        contour_masks = extract_contour_masks(seg_maps)
+        contour_masks = (x[:, 0] > 0).to(torch.bool)  # match network observation exactly
 
         # self._poses = poses_before
         self._targets_pos = targets_pos
@@ -652,9 +637,9 @@ class Trainer:
 
         return x.to(DEVICE), contour_masks.to(DEVICE), poses_before
 
-    def train_episode(self, episode: int):
+    async def train_episode(self, episode: int):
         self._decay_schedule(episode)
-        x, contour_masks, poses_before = self._reset_episode()
+        x, contour_masks, poses_before = await self._reset_episode()
 
         ep_return = 0.0
         ep_len = 0
@@ -667,26 +652,24 @@ class Trainer:
             )
 
             #* — execute —————————————————————————————————————
-            poses_after, _ = env_step(
+            poses_after, _ = await env_step_async(
                 self.fingers, pixel_ij, d_xy, delta_d, self.K,
             )
             rewards, dones = compute_rewards(poses_before, poses_after,
-                                             self._targets_pos)
+                                             self._targets_pos, self._env_root_pos)
 
             #* — observe next state ——————————————————————————
             x_next, seg_maps_next = build_vision_observation(
                 poses_after, self._targets_pos, self._targets_ori, self.K,
                 env_root_pos=self._env_root_pos,
             )
-            contour_masks_next = extract_contour_masks(seg_maps_next)
+            contour_masks_next = x_next[:, 0] > 0  # match network observation exactly
 
             #* — store per-env transitions ————————————————————
             for b in range(NUM_ENVS):
                 self.buffer.push(
                     x[b:b+1], pixel_ij[b], d_xy[b], float(delta_d[b]),
                     float(rewards[b]), x_next[b:b+1], bool(dones[b]),
-                    contour_masks[b].cpu().numpy(),
-                    contour_masks_next[b].cpu().numpy(),
                 )
 
             ep_return += rewards.sum()
@@ -735,22 +718,27 @@ class Trainer:
 #*  Entry point
 #* ================================================================
 
-def main(num_episodes: int = 10_000):
+async def main_async(num_episodes: int = 10_000):
     trainer = Trainer()
+    await trainer.setup()
     print(f"[train] device={DEVICE}  envs={NUM_ENVS}  buffer={BUFFER_CAPACITY}")
     print(f"[train] max_steps/ep={MAX_STEPS}  gamma={GAMMA}  lr={LR}")
 
     for ep in range(1, num_episodes + 1):
         t0 = time.time()
-        ep_r, ep_len = trainer.train_episode(ep)
+        ep_r, ep_len = await trainer.train_episode(ep)
         trainer.log(ep, ep_r, ep_len, time.time() - t0)
 
     print("[train] done.")
     return trainer
 
 
+def main(num_episodes: int = 10_000):
+    return run_coroutine(main_async(num_episodes))
+
+
 if __name__ == "__main__":
-    trainer = main()
+    trainer_task = main()
 
 
 
@@ -780,3 +768,14 @@ if __name__ == "__main__":
 #* step (about 15-20 physics frames). But this is a training-speed optimization,
 #* not a correctness fix. Start with the lift approach; add heuristic reset 
 #* later if the overhead is too high.
+
+#! fix the issues here:
+# 1. RL correctness issues
+# 2. build_vision_observation() combines targets from every environment into one goal image and then gives that same image to every environment. Each environment needs its own goal contour.
+# 3. The Q-map used for action selection is conditioned on the spatial mean of the action parameters, while critic training conditions it on the selected pixel’s executed parameters. Those are different definitions of \(Q(s,a)\).
+# 4. FiLM parameters belong to both optimizers and are updated by the actor loss. This lets the critic itself change to increase its output instead of optimizing only the actor parameters.
+# 5. Completed environments continue receiving actions until all environments succeed. They can collect repeated success bonuses and later become unsuccessful again.
+# 6. The clipped reward max(0, d_before-d_after) permits reward farming by repeatedly moving away and back toward the target.
+# 7. global_step increases by 12. Therefore % TRAIN_EVERY with TRAIN_EVERY=4 is always true, while % 5000 only becomes true every 15,000 transitions.
+# 8. Empty contour masks lead to a bogus (0,0) action or a target Q-value of -inf.
+# 9. Strike and standoff targets are not clipped to the prismatic joint limits.

@@ -759,31 +759,28 @@ def build_vision_observation(
     num_envs = list(env_poses.values())[0][0].shape[0]
     seg_maps = render_segmentation_ground_truth(env_poses, K, resolution, env_root_pos)
 
-    #* goal contour: shift target poses by env_0 offset (all envs share same goal layout)
-    if env_root_pos is not None:
-        goal_offset = env_root_pos[0, :2]
-        local_target_positions = {}
-        for name, tpos in target_positions.items():
-            shifted = tpos.copy()
-            shifted[:, :2] -= goal_offset
-            local_target_positions[name] = shifted
-    else:
-        local_target_positions = target_positions
-
-    contour_goal_all = render_goal_contour(
-        local_target_positions, target_orientations, K, resolution
-    )
-
     contour_currents = []
+    contour_goals = []
     for env_idx in range(num_envs):
         contour_currents.append(
             segmentation_to_contour_current(seg_maps[env_idx])
         )
 
+        # per-env goal contour — each env renders its own targets in its local frame
+        offset = env_root_pos[env_idx, :2] if env_root_pos is not None else np.zeros(2)
+        env_targets = {}
+        for name, tpos in target_positions.items():
+            shifted = tpos[env_idx:env_idx + 1].copy()
+            shifted[:, :2] -= offset
+            env_targets[name] = shifted
+        env_oris = {name: ori[env_idx:env_idx + 1]
+                    for name, ori in target_orientations.items()}
+        contour_goals.append(
+            render_goal_contour(env_targets, env_oris, K, resolution)
+        )
+
     contour_current_batch = np.stack(contour_currents, axis=0)  # (N, H, W)
-    contour_goal_batch = np.tile(
-        contour_goal_all[None, ...], (num_envs, 1, 1)
-    )  # (N, H, W)
+    contour_goal_batch = np.stack(contour_goals, axis=0)        # (N, H, W)
 
     x = stack_input(contour_current_batch, contour_goal_batch)
     return x, seg_maps
