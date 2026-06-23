@@ -85,9 +85,9 @@ MAX_STEPS: int = 30              # max pokes per episode
 C_STEP: float = 0.01             # per-step penalty
 C_SUCCESS: float = 10.0          # terminal success bonus
 SUCCESS_THRESHOLD: float = 0.02  # metres — tolerance to target
-A_MAX: float = 5.0               # max finger acceleration (m/s²) 13 m/s² for panda ee
+A_MAX: float = 8.0               # max finger acceleration (m/s²) 13 m/s² for panda ee
 DELTA_D_MAX: float = 0.2          # max standoff (m)
-IMPACT_STEPS: int = 30            # physics steps per strike
+IMPACT_STEPS: int = 40            # physics steps per strike (k_p=200, m≈2 kg)
 OVERTRAVEL: float = 0.05          # finger pushes this far past contact (m)
 SAFE_Z: float = FINGER_CONFIG["default_xyz"][2]  # safe height (m)
 
@@ -383,6 +383,7 @@ async def env_step_async(
     #* ── standoff & speed from Δd ────────────────────────────────────
     delta_d_clipped = np.clip(delta_d, 0.001, DELTA_D_MAX)
     speeds = np.sqrt(2.0 * A_MAX * delta_d_clipped)          # g(Δd)
+    speeds = np.clip(speeds, 0.0, 2.0)                       # respect real EE limit
     standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up
 
     #* ── Phase 0: lift to safe height above current position ─────────
@@ -391,7 +392,7 @@ async def env_step_async(
     q0[:, 2] = SAFE_Z
     fingers.set_dof_position_targets(positions=q0.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(20)
+    await _step_physics(25)
 
     #* ── Phase 1: move to standoff at safe height (above objects) ───
     q1 = np.zeros((B, 3), dtype=np.float32)
@@ -399,13 +400,13 @@ async def env_step_async(
     q1[:, 1] = standoff_xy[:, 1]
     q1[:, 2] = SAFE_Z
     fingers.set_dof_position_targets(positions=q1.tolist(), dof_indices=dof_indices)
-    await _step_physics(30)
+    await _step_physics(40)
 
     #* ── Phase 2: descend to standoff at object height ───────────────
     q2 = q1.copy()
     q2[:, 2] = OBJECT_HEIGHT
     fingers.set_dof_position_targets(positions=q2.tolist(), dof_indices=dof_indices)
-    await _step_physics(15)
+    await _step_physics(20)
 
     #* ── Phase 3: strike — push OVERTRAVEL past contact ──────────────
     q3 = np.zeros((B, 3), dtype=np.float32)
@@ -426,7 +427,7 @@ async def env_step_async(
     q4[:, 2] = SAFE_Z
     fingers.set_dof_position_targets(positions=q4.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(15)
+    await _step_physics(20)
 
     #* ── Phase 5: settle objects — wait until all stopped ────────────
     VEL_THRESH = 0.005
