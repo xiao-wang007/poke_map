@@ -17,6 +17,7 @@ Architecture
 
 from __future__ import annotations
 
+import __main__
 import gc
 from collections import deque
 from pathlib import Path
@@ -91,16 +92,19 @@ IMPACT_STEPS: int = 40            # physics steps per strike (k_p=200, m≈2 kg)
 OVERTRAVEL: float = 0.05          # finger pushes this far past contact (m)
 SAFE_Z: float = FINGER_CONFIG["default_xyz"][2]  # safe height (m)
 
-TARGET_UPDATE_EVERY: int = 5000   # steps between soft updates
-#! TARGET_UPDATE_EVERY = 100 with 12 envs means the target network 
-#! updates every ~8 episode steps (each step adds 12 to global_step). 
-#! Standard DQN updates the target every 2000-10000 global steps. 
-#! This will cause the TD target to chase a moving target, 
-#! destabilizing training. Change to 5000.
+# yaw curriculum — translation-first, orientation added gradually
+C_YAW: float = 0.5                     # weight on orientation progress reward
+YAW_THRESHOLD: float = np.deg2rad(10)  # radians — tolerance for success
+YAW_CURRICULUM_START: int = 0          # episode to begin expanding yaw range
+YAW_CURRICULUM_END: int = 500          # episode to reach full yaw range
+YAW_FULL_RANGE: float = np.pi          # radians — ±180° full orientation
 
 TRAIN_AFTER: int = 256           # start training after this many transitions
 TRAIN_EVERY: int = 4             # train every N env steps
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_EVERY: int = 100       # episodes between saves
+CHECKPOINT_KEEP: int = 3          # how many recent checkpoints to keep
 
 
 #* ================================================================
@@ -158,8 +162,8 @@ class ReplayBuffer:
 
     def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
         indices = torch.randint(0, self.size, (batch_size,))
-        x      = self.x[indices].to(torch.float32).to(self.device)
-        x_next = self.x_next[indices].to(torch.float32).to(self.device)
+        x      = self.x[indices].to(torch.float32).to(self.device) / 255.0
+        x_next = self.x_next[indices].to(torch.float32).to(self.device) / 255.0
         return {
             "x":         x,
             "pixel":     self.pixel[indices].to(self.device),
@@ -237,8 +241,12 @@ def select_action(
     contour_masks: torch.Tensor,           # (B, H, W) bool
     epsilon: float,
     noise_std: float,
+    top_k: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Select actions for a batch of observations.
+
+    Greedy envs use per-pixel FiLM-conditioned pixel selection (top-K
+    re-evaluation).  ε-greedy envs pick a random valid pixel.
 
     Returns
     -------
@@ -247,46 +255,46 @@ def select_action(
     delta_d  : (B,)  float — standoff in [0, delta_d_max]
     """
     B = x.shape[0]
-    H, W = x.shape[-2:]
     device = x.device
     actor_critic.eval()
 
-    with torch.no_grad():
-        q_map, params = actor_critic(x)         # (B, 1, H, W), (B, 3, H, W)
-        q_map_sq = q_map.squeeze(1)             # (B, H, W)
-
-    #* mask non-contour pixels
-    q_map_sq[~contour_masks] = -float("inf")
-
-    #* ε-greedy pixel selection
     pixel_ij = np.zeros((B, 2), dtype=np.int32)
     d_xy_arr = np.zeros((B, 2), dtype=np.float32)
     delta_d_arr = np.zeros(B, dtype=np.float32)
 
-    for b in range(B):
-        if np.random.random() < epsilon:
-            # random valid pixel
-            valid = torch.nonzero(contour_masks[b], as_tuple=True)
-            if len(valid[0]) == 0:
-                continue  # no contour → action stays zero
-            r = np.random.randint(len(valid[0]))
-            row, col = valid[0][r].item(), valid[1][r].item()
-            pixel_ij[b] = [row, col]
-        else:
-            idx = q_map_sq[b].argmax().item()
-            pixel_ij[b, 0] = idx // W
-            pixel_ij[b, 1] = idx % W
+    with torch.no_grad():
+        # one U-Net pass — features + per-pixel params
+        f, params, _ = actor_critic.features_and_params(x)
 
-        # read params at selected pixel
-        p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
+        # batched greedy pixel selection (per-pixel FiLM conditioned)
+        greedy_pix, _ = actor_critic.greedy_pixel(f, params, contour_masks, top_k=top_k)
 
-        d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
-        dd_noisy = p[2] + abs(np.random.randn().astype(np.float32)) * noise_std
+        for b in range(B):
+            if contour_masks[b].sum() == 0:
+                delta_d_arr[b] = 0.0           # no-op poke (empty contour)
+                continue
 
-        # clamp & normalise direction
-        norm = np.linalg.norm(d_noisy) + 1e-8
-        d_xy_arr[b] = d_noisy / norm
-        delta_d_arr[b] = np.clip(dd_noisy, 0.0, actor_critic.delta_d_max)
+            if np.random.random() < epsilon:
+                # ε-greedy: random valid pixel
+                valid = torch.nonzero(contour_masks[b], as_tuple=True)
+                r = np.random.randint(len(valid[0]))
+                pixel_ij[b, 0] = valid[0][r].item()
+                pixel_ij[b, 1] = valid[1][r].item()
+            else:
+                # greedy: pre-computed per-pixel-conditioned best pixel
+                pixel_ij[b, 0] = greedy_pix[b, 0].item()
+                pixel_ij[b, 1] = greedy_pix[b, 1].item()
+
+            # read params at selected pixel
+            p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
+
+            d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
+            dd_noisy = p[2] + abs(np.random.randn().astype(np.float32)) * noise_std
+
+            # clamp & normalise direction
+            norm = np.linalg.norm(d_noisy) + 1e-8
+            d_xy_arr[b] = d_noisy / norm
+            delta_d_arr[b] = np.clip(dd_noisy, 0.0, actor_critic.delta_d_max)
 
     return pixel_ij, d_xy_arr, delta_d_arr
 
@@ -296,38 +304,67 @@ def select_action(
 #*  Reward & termination
 #* ================================================================
 
+def _yaw_error(quats: np.ndarray, target_quats: np.ndarray) -> np.ndarray:
+    """Wrapped angle difference between quaternion yaws (radians, [0, π])."""
+    yaw = 2.0 * np.arctan2(quats[:, 3], quats[:, 0])
+    t_yaw = 2.0 * np.arctan2(target_quats[:, 3], target_quats[:, 0])
+    diff = yaw - t_yaw
+    return np.abs(np.arctan2(np.sin(diff), np.cos(diff)))
+
+
+def _yaws_to_quats(yaws: np.ndarray) -> np.ndarray:
+    """Convert yaw angles to quaternions [w, x, y, z] (rotation about Z)."""
+    half = yaws * 0.5
+    out = np.zeros((yaws.shape[0], 4), dtype=np.float32)
+    out[:, 0] = np.cos(half)
+    out[:, 3] = np.sin(half)
+    return out
+
+
 def compute_rewards(
     poses_before: dict,         # obj_name → (positions, quaternions) in world coords
     poses_after: dict,
     targets: dict,              # obj_name → (N_envs, 3)  in env-local coords
-    env_root_pos: np.ndarray | None = None,  # (N_envs, 3)  world position of each env root
-) -> tuple[np.ndarray, np.ndarray]:
+    env_root_pos: np.ndarray | None = None,  # (N_envs, 3)
+    done_once: np.ndarray | None = None,     # (N_envs,) bool
+    target_oris: dict | None = None,         # obj_name → (N_envs, 4) quat targets
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-env reward + done flag.
 
-    #! TODO: may incorporate velocity reward, orientation error, 
-    #!       possibly contact/force signals, negative shaping, etc
-
-    r = Σ max(0, d_before - d_after) - c_step  (+ c_success if all at target)
+    Progress reward: signed distance + signed yaw reduction.
+    C_SUCCESS awarded only the first time an env achieves the threshold.
     """
     num_envs = list(poses_before.values())[0][0].shape[0]
     r = np.zeros(num_envs, dtype=np.float32)
     done = np.ones(num_envs, dtype=bool)
+    if done_once is None:
+        done_once = np.zeros(num_envs, dtype=bool)
 
     offset = env_root_pos[:, :2] if env_root_pos is not None else np.zeros((num_envs, 2))
 
     for obj_name in poses_before:
         pos_before = poses_before[obj_name][0].copy()
         pos_after  = poses_after[obj_name][0].copy()
-        pos_before[:, :2] -= offset           # world → env-local
+        pos_before[:, :2] -= offset
         pos_after[:, :2]  -= offset
         d_before = np.linalg.norm(pos_before[:, :2] - targets[obj_name][:, :2], axis=1)
         d_after  = np.linalg.norm(pos_after[:, :2] - targets[obj_name][:, :2], axis=1)
-        r += np.maximum(0.0, d_before - d_after)
+        r += d_before - d_after
         done &= (d_after < SUCCESS_THRESHOLD)
 
+        if obj_name == "LObject" and target_oris is not None and obj_name in target_oris:
+            y_err_before = _yaw_error(poses_before[obj_name][1], target_oris[obj_name])
+            y_err_after  = _yaw_error(poses_after[obj_name][1], target_oris[obj_name])
+            r += C_YAW * (y_err_before - y_err_after)
+            done &= (y_err_after < YAW_THRESHOLD)
+
     r -= C_STEP
-    r[done] += C_SUCCESS
-    return r, done
+
+    first_done = done & ~done_once
+    r[first_done] += C_SUCCESS
+    done_once = done_once | done
+
+    return r, done, done_once
 
 
 #* ================================================================
@@ -340,6 +377,7 @@ async def env_step_async(
     d_xy: np.ndarray,            # (B, 2)
     delta_d: np.ndarray,         # (B,)
     K: np.ndarray,
+    active: np.ndarray | None = None,  # (B,) bool — which envs to control
 ) -> tuple[dict, np.ndarray]:
     """Execute strikes with the prismatic XYZ finger robot.
 
@@ -347,9 +385,12 @@ async def env_step_async(
       0. lift to safe height above current XY
       1. move to standoff_xy at safe height (collision-free)
       2. descend to standoff_xy at object height
-      3. strike — push OVERTRAVEL past contact with velocity
+      3. strike — push OVERTRAVEL past contact
       4. retract to safe height
       5. settle objects
+
+    Inactive envs (where active=False) are frozen at their current position
+    throughout all phases — no strike, no movement.
     """
     B = len(fingers)
     dof_indices = fingers.get_dof_indices(fingers.dof_names)
@@ -366,30 +407,40 @@ async def env_step_async(
     dirs = d_xy / dir_norm
 
     zero_v = np.zeros((B, 3), dtype=np.float32)
+    xy_low  = np.array(LIMIT_LOWER[:2], dtype=np.float32)
+    xy_high = np.array(LIMIT_UPPER[:2], dtype=np.float32)
 
     #* ── standoff from Δd ────────────────────────────────────────────
     delta_d_clipped = np.clip(delta_d, 0.001, DELTA_D_MAX)
     standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up
 
-    #* ── Phase 0: lift to safe height above current position ─────────
+    #* ── snap initial positions (inactive envs hold these throughout) ──
     q_cur = as_numpy(fingers.get_dof_positions()).copy()     # (B, 3)
+
+    def _hold_inactive(targets: np.ndarray):
+        if active is not None:
+            targets[~active] = q_cur[~active]
+
+    #* ── Phase 0: lift to safe height above current position ─────────
     q0 = q_cur.copy()
     q0[:, 2] = SAFE_Z
+    _hold_inactive(q0)
     fingers.set_dof_position_targets(positions=q0.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
     await _step_physics(25)
 
     #* ── Phase 1: move to standoff at safe height (above objects) ───
     q1 = np.zeros((B, 3), dtype=np.float32)
-    q1[:, 0] = standoff_xy[:, 0]
-    q1[:, 1] = standoff_xy[:, 1]
+    q1[:, :2] = np.clip(standoff_xy, xy_low, xy_high)
     q1[:, 2] = SAFE_Z
+    _hold_inactive(q1)
     fingers.set_dof_position_targets(positions=q1.tolist(), dof_indices=dof_indices)
     await _step_physics(40)
 
     #* ── Phase 2: descend to standoff at object height ───────────────
     q2 = q1.copy()
     q2[:, 2] = OBJECT_HEIGHT
+    _hold_inactive(q2)
     fingers.set_dof_position_targets(positions=q2.tolist(), dof_indices=dof_indices)
     await _step_physics(20)
 
@@ -398,9 +449,9 @@ async def env_step_async(
     #* pushing force kp*OVERTRAVEL.  No velocity target avoids oscillation
     #* at the contact point (velocity tracking fights the constraint).
     q3 = np.zeros((B, 3), dtype=np.float32)
-    q3[:, 0] = world_xy[:, 0] + dirs[:, 0] * OVERTRAVEL
-    q3[:, 1] = world_xy[:, 1] + dirs[:, 1] * OVERTRAVEL
+    q3[:, :2] = np.clip(world_xy + dirs * OVERTRAVEL, xy_low, xy_high)
     q3[:, 2] = OBJECT_HEIGHT
+    _hold_inactive(q3)
 
     fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
@@ -409,6 +460,7 @@ async def env_step_async(
     #* ── Phase 4: retract to safe height ─────────────────────────────
     q4 = q3.copy()
     q4[:, 2] = SAFE_Z
+    _hold_inactive(q4)
     fingers.set_dof_position_targets(positions=q4.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
     await _step_physics(20)
@@ -466,22 +518,14 @@ def train_step(
     #*  LOSS 1 — Q-Loss (Huber TD)
     #* =================================================================
 
-    #* target Q-value — conditioned on the specific next-action params
-    #! The argmax pixel is still selected via the cheap mean-conditioned 
-    #! Q (a heuristic), then re-evaluated with specific-param conditioning 
-    #! for the actual target value. 
+    #* target Q-value — per-pixel FiLM conditioned, same selection as acting
     with torch.no_grad():
-        q_next, params_next = target_net(x_next)
-        q_next_sq = q_next.squeeze(1)
-        q_next_sq[~mask_next] = -float("inf")
-        pixel_next_flat = q_next_sq.view(B, -1).argmax(dim=1)
-        pixel_next = torch.stack([pixel_next_flat // q_next.shape[-1],
-                                  pixel_next_flat % q_next.shape[-1]], dim=1)
+        f_next, params_next, _ = target_net.features_and_params(x_next)
+        pixel_next, q_max_next = target_net.greedy_pixel(
+            f_next, params_next, mask_next)
 
-        # Q(s', pixel', params_at_pixel') — consistent with online Q definition
-        params_next_at = target_net.params_at_pixel(params_next, pixel_next)
-        q_map_next = target_net.q_map_with_params(x_next, params_next_at)
-        q_max_next = q_map_next[batch_idx, 0, pixel_next[:, 0], pixel_next[:, 1]]
+        # zero future value for batch items with no valid next-state contour
+        q_max_next[~mask_next.any(dim=(-2, -1))] = 0.0
 
         target = r.squeeze() + gamma * q_max_next * (~done.squeeze())
 
@@ -505,6 +549,8 @@ def train_step(
         p.requires_grad = False
     for p in actor_critic.unet.parameters():
         p.requires_grad = False
+    for p in actor_critic.film.parameters():
+        p.requires_grad = False
 
     #* recompute encoder features (detached) and actor params
     f, params_act, _ = actor_critic.features_and_params(x)
@@ -513,7 +559,7 @@ def train_step(
     #* actor params at the stored pixel
     params_actor_at = actor_critic.params_at_pixel(params_act, pixel)  # (B, 3)
 
-    #* FiLM from actor params (GRADS flow through film MLPs → param_head)
+    #* FiLM from actor params (forward only — film weights frozen, no gradients)
     film_gamma, film_beta = actor_critic.film(params_actor_at)
     f_mod_pg = film_gamma[:, :, None, None] * f_detached + film_beta[:, :, None, None]
     q_map_pg = actor_critic.q_head(f_mod_pg)   # q_head frozen, just forward
@@ -524,17 +570,16 @@ def train_step(
     optimizer_mu.zero_grad()
     L_mu.backward()
 
-    #!clip_grad_norm_ scoped to _mu_params only (lines 519-521) Only clips film 
-    #! + param_head params, not the stale gradients on frozen q_head/unet. Correct fix.
-    _mu_params = list(actor_critic.param_head.parameters()) + \
-                 list(actor_critic.film.parameters())
-    torch.nn.utils.clip_grad_norm_(_mu_params, 10.0)
+    # grad clip scoped to param_head only — film/q_head/unet are frozen
+    torch.nn.utils.clip_grad_norm_(actor_critic.param_head.parameters(), 10.0)
     optimizer_mu.step()
 
     #* unfreeze
     for p in actor_critic.q_head.parameters():
         p.requires_grad = True
     for p in actor_critic.unet.parameters():
+        p.requires_grad = True
+    for p in actor_critic.film.parameters():
         p.requires_grad = True
 
     return L_Q.item(), L_mu.item()
@@ -565,8 +610,7 @@ class Trainer:
         q_params = list(self.actor_critic.q_head.parameters()) + \
                    list(self.actor_critic.film.parameters()) + \
                    list(self.actor_critic.unet.parameters())
-        mu_params = list(self.actor_critic.param_head.parameters()) + \
-                    list(self.actor_critic.film.parameters())
+        mu_params = list(self.actor_critic.param_head.parameters())
 
         self.optimizer_q = torch.optim.Adam(q_params, lr=LR)
         self.optimizer_mu = torch.optim.Adam(mu_params, lr=LR)
@@ -585,7 +629,16 @@ class Trainer:
         """Async init — starts sim, gets handles, configures drives."""
         await ensure_sim_running_async()
         self.fingers, self.tips, self.env_roots = get_finger_handles()
-        configure_drives(self.fingers)
+
+        finger_props = globals().get("randomized_finger_properties",
+                        getattr(__main__, "randomized_finger_properties", None))
+        if finger_props is not None:
+            configure_drives(self.fingers,
+                             stiffnesses=finger_props["stiffnesses"],
+                             dampings=finger_props["dampings"])
+        else:
+            configure_drives(self.fingers)
+
         self.K = get_camera_intrinsics()
 
     def _decay_schedule(self, episode: int):
@@ -595,7 +648,7 @@ class Trainer:
 
 
     #! Reset 
-    async def _reset_episode(self) -> tuple[torch.Tensor, list, torch.Tensor, dict]:
+    async def _reset_episode(self, episode: int) -> tuple[torch.Tensor, list, torch.Tensor, dict]:
         """Randomise objects + targets, return first observation."""
         #* RigidPrim handles (use same patterns as scene setup)
         l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
@@ -605,6 +658,11 @@ class Trainer:
             self.env_roots, l_objects, cylinder_objects,
             seed=None,
         )
+        # clear residual velocities from previous episode
+        zero_vel = np.zeros((NUM_ENVS, 3), dtype=np.float32)
+        zero_ang = np.zeros((NUM_ENVS, 3), dtype=np.float32)
+        l_objects.set_velocities(linear_velocities=zero_vel, angular_velocities=zero_ang)
+        cylinder_objects.set_velocities(linear_velocities=zero_vel, angular_velocities=zero_ang)
         await _step_physics(SCENE_CONFIG["settle_steps"])
 
         #* ── reposition finger at object level (centre of each env) ──
@@ -615,48 +673,68 @@ class Trainer:
         self.fingers.set_dof_velocity_targets(velocities=init_vel.tolist(), dof_indices=dof_idx)
         await _step_physics(30)  # let PD converge to centre
 
-        # random targets
+        # random position targets
         targets_pos = sample_target_poses(self.rng, NUM_ENVS)
-        targets_ori = {"LObject": np.zeros((NUM_ENVS, 4), dtype=np.float32),
-                       "Cylinder": np.zeros((NUM_ENVS, 4), dtype=np.float32)}
-        targets_ori["LObject"][:, 0] = 1.0
+
+        # query current object poses for yaw curriculum
+        poses_before, env_root_pos = get_object_poses_vectorized()
+
+        # target orientations — Cylinder is identity, LObject uses curriculum
+        targets_ori = {"Cylinder": np.zeros((NUM_ENVS, 4), dtype=np.float32)}
         targets_ori["Cylinder"][:, 0] = 1.0
 
+        l_quats = poses_before["LObject"][1]
+        l_yaws = 2.0 * np.arctan2(l_quats[:, 3], l_quats[:, 0])
+
+        # yaw curriculum: linear ramp from 0 to full range
+        frac = np.clip((episode - YAW_CURRICULUM_START) /
+                       max(1, YAW_CURRICULUM_END - YAW_CURRICULUM_START), 0.0, 1.0)
+        yaw_half_range = frac * YAW_FULL_RANGE
+        l_target_yaws = l_yaws + self.rng.uniform(-yaw_half_range, yaw_half_range,
+                                                   size=NUM_ENVS)
+        targets_ori["LObject"] = _yaws_to_quats(l_target_yaws.astype(np.float32))
+
         # vision
-        poses_before, env_root_pos = get_object_poses_vectorized()
         x, seg_maps = build_vision_observation(
             poses_before, targets_pos, targets_ori, self.K,
             env_root_pos=env_root_pos,
         )
         contour_masks = (x[:, 0] > 0).to(torch.bool)  # match network observation exactly
 
-        # self._poses = poses_before
         self._targets_pos = targets_pos
         self._targets_ori = targets_ori
         self._env_root_pos = env_root_pos
+        self._done_once = np.zeros(NUM_ENVS, dtype=bool)
 
         return x.to(DEVICE), contour_masks.to(DEVICE), poses_before
 
     async def train_episode(self, episode: int):
         self._decay_schedule(episode)
-        x, contour_masks, poses_before = await self._reset_episode()
+        x, contour_masks, poses_before = await self._reset_episode(episode)
 
         ep_return = 0.0
         ep_len = 0
 
         for step in range(MAX_STEPS):
+            has_contour = contour_masks.any(dim=(-2, -1)).cpu().numpy()
+            was_active = ~self._done_once & has_contour  # done OR invisible → frozen
+
             #* — select actions ——————————————————————————————
             pixel_ij, d_xy, delta_d = select_action(
                 self.actor_critic, x, contour_masks,
                 self.epsilon, self.noise_std,
             )
 
-            #* — execute —————————————————————————————————————
+            #* — execute (only active envs move; inactive held frozen) —
             poses_after, _ = await env_step_async(
                 self.fingers, pixel_ij, d_xy, delta_d, self.K,
+                active=was_active,
             )
-            rewards, dones = compute_rewards(poses_before, poses_after,
-                                             self._targets_pos, self._env_root_pos)
+            rewards, dones, self._done_once = compute_rewards(
+                poses_before, poses_after,
+                self._targets_pos, self._env_root_pos, self._done_once,
+                target_oris=self._targets_ori)
+            rewards[~was_active] = 0.0
 
             #* — observe next state ——————————————————————————
             x_next, seg_maps_next = build_vision_observation(
@@ -665,21 +743,24 @@ class Trainer:
             )
             contour_masks_next = x_next[:, 0] > 0  # match network observation exactly
 
-            #* — store per-env transitions ————————————————————
+            #* — store transitions for envs active at step start ——————
+            truncated = (step == MAX_STEPS - 1)
             for b in range(NUM_ENVS):
-                self.buffer.push(
-                    x[b:b+1], pixel_ij[b], d_xy[b], float(delta_d[b]),
-                    float(rewards[b]), x_next[b:b+1], bool(dones[b]),
-                )
+                if was_active[b]:
+                    self.buffer.push(
+                        x[b:b+1], pixel_ij[b], d_xy[b], float(delta_d[b]),
+                        float(rewards[b]), x_next[b:b+1],
+                        bool(self._done_once[b] or truncated),
+                    )
 
-            ep_return += rewards.sum()
+            ep_return += rewards[was_active].sum()
             ep_len += 1
 
             #* — advance state ————————————————————————————————
             x = x_next.to(DEVICE)
             contour_masks = contour_masks_next.to(DEVICE)
             poses_before = poses_after
-            self.global_step += NUM_ENVS
+            self.global_step += 1
 
             #* — training —————————————————————————————————————
             if self.buffer.size >= TRAIN_AFTER and self.global_step % TRAIN_EVERY == 0:
@@ -689,12 +770,9 @@ class Trainer:
                     self.optimizer_q, self.optimizer_mu,
                     batch,
                 )
-
-            #* — target update ———————————————————————————————
-            if self.global_step % TARGET_UPDATE_EVERY == 0:
                 soft_update(self.target_net, self.actor_critic, TAU)
 
-            if dones.all():
+            if self._done_once.all():
                 break
 
         self.ep_returns.append(ep_return)
@@ -713,69 +791,98 @@ class Trainer:
             f"buf={self.buffer.size:6d}  dt={elapsed:.1f}s"
         )
 
+    def save_checkpoint(self, path: str | Path, episode: int):
+        """Save full training state to disk."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "actor_critic": self.actor_critic.state_dict(),
+            "target_net":   self.target_net.state_dict(),
+            "optimizer_q":  self.optimizer_q.state_dict(),
+            "optimizer_mu": self.optimizer_mu.state_dict(),
+            "global_step":  self.global_step,
+            "epsilon":      self.epsilon,
+            "noise_std":    self.noise_std,
+            "episode":      episode,
+            "rng_state":    self.rng.bit_generator.state,
+            "ep_returns":   list(self.ep_returns),
+            "ep_lengths":   list(self.ep_lengths),
+            "buffer_x":       self.buffer.x[:self.buffer.size].clone(),
+            "buffer_x_next":  self.buffer.x_next[:self.buffer.size].clone(),
+            "buffer_pixel":   self.buffer.pixel[:self.buffer.size].clone(),
+            "buffer_d_xy":    self.buffer.d_xy[:self.buffer.size].clone(),
+            "buffer_delta_d": self.buffer.delta_d[:self.buffer.size].clone(),
+            "buffer_r":       self.buffer.r[:self.buffer.size].clone(),
+            "buffer_done":    self.buffer.done[:self.buffer.size].clone(),
+            "buffer_ptr":     self.buffer.ptr,
+            "buffer_size":    self.buffer.size,
+        }, path)
+        print(f"[checkpoint] saved ep {episode} to {path} "
+              f"(buf={self.buffer.size})")
 
-#* ================================================================
-#*  Entry point
-#* ================================================================
+    def load_checkpoint(self, path: str | Path) -> int:
+        """Restore training state from disk.  Returns the last saved episode."""
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+        self.actor_critic.load_state_dict(ckpt["actor_critic"])
+        self.target_net.load_state_dict(ckpt["target_net"])
+        self.optimizer_q.load_state_dict(ckpt["optimizer_q"])
+        self.optimizer_mu.load_state_dict(ckpt["optimizer_mu"])
+        self.global_step = ckpt["global_step"]
+        self.epsilon     = ckpt["epsilon"]
+        self.noise_std   = ckpt["noise_std"]
+        self.rng.bit_generator.state = ckpt["rng_state"]
+        self.ep_returns = deque(ckpt["ep_returns"], maxlen=100)
+        self.ep_lengths = deque(ckpt["ep_lengths"], maxlen=100)
 
-async def main_async(num_episodes: int = 10_000):
+        size = ckpt["buffer_size"]
+        self.buffer.ptr  = ckpt["buffer_ptr"] % self.buffer.capacity
+        self.buffer.size = min(size, self.buffer.capacity)
+        s = self.buffer.size
+        self.buffer.x[:s].copy_(ckpt["buffer_x"][:s])
+        self.buffer.x_next[:s].copy_(ckpt["buffer_x_next"][:s])
+        self.buffer.pixel[:s].copy_(ckpt["buffer_pixel"][:s])
+        self.buffer.d_xy[:s].copy_(ckpt["buffer_d_xy"][:s])
+        self.buffer.delta_d[:s].copy_(ckpt["buffer_delta_d"][:s])
+        self.buffer.r[:s].copy_(ckpt["buffer_r"][:s])
+        self.buffer.done[:s].copy_(ckpt["buffer_done"][:s])
+
+        print(f"[checkpoint] loaded ep {ckpt['episode']} from {path} "
+              f"(buf={s}, step={self.global_step})")
+        return ckpt["episode"]
+
+async def main_async(num_episodes: int = 10_000, resume: str | None = None):
     trainer = Trainer()
-    await trainer.setup()
+    start_ep = 1
+    if resume:
+        await trainer.setup()
+        start_ep = trainer.load_checkpoint(resume) + 1
+    else:
+        await trainer.setup()
+
     print(f"[train] device={DEVICE}  envs={NUM_ENVS}  buffer={BUFFER_CAPACITY}")
     print(f"[train] max_steps/ep={MAX_STEPS}  gamma={GAMMA}  lr={LR}")
+    if resume:
+        print(f"[train] resuming from episode {start_ep}")
 
-    for ep in range(1, num_episodes + 1):
+    for ep in range(start_ep, num_episodes + 1):
         t0 = time.time()
         ep_r, ep_len = await trainer.train_episode(ep)
         trainer.log(ep, ep_r, ep_len, time.time() - t0)
+
+        if ep % CHECKPOINT_EVERY == 0:
+            trainer.save_checkpoint(CHECKPOINT_DIR / f"ep{ep:06d}.pt", ep)
+            # keep last N checkpoints
+            saved = sorted(CHECKPOINT_DIR.glob("ep*.pt"))
+            for old in saved[:-CHECKPOINT_KEEP]:
+                old.unlink()
 
     print("[train] done.")
     return trainer
 
 
-def main(num_episodes: int = 10_000):
-    return run_coroutine(main_async(num_episodes))
+def main(num_episodes: int = 10_000, resume: str | None = None):
+    return run_coroutine(main_async(num_episodes, resume))
 
 
 if __name__ == "__main__":
     trainer_task = main()
-
-
-
-
-
-#* You're right — the current code has a collision risk. The finger moves in 
-#* a straight line to standoff_xy at OBJECT_HEIGHT. If the standoff is on 
-#* the far side of the object from the finger's current position, 
-#* the straight-line path passes through the object.
-
-#* The fix: lift before approach
-#* Restore a minimal height staging — 2 extra lines, no heuristic needed:
-#* Phase 0:  q = (current_xy, SAFE_Z)           ← lift above objects (~0.1s)
-#* Phase 1:  q = (standoff_xy, SAFE_Z)          ← move above, no collision risk
-#* Phase 2:  q = (standoff_xy, OBJECT_HEIGHT)    ← descend at standoff
-#* Phase 3:  q = (world_xy + overtravel·d̂, OBJECT_HEIGHT)  ← strike
-#*           v = d̂·speed
-#* Phase 4:  settle objects
-#* The key: horizontal movement happens at SAFE_Z (above all objects). The 
-#* finger is only at OBJECT_HEIGHT during the strike, when it's already 
-#* at the correct standoff position.
-
-#TODOs:
-#* Heuristic reset: not needed for correctness, useful for speed
-#* You could bias object placement so the finger's default position is 
-#* already on the correct side — this would save the Phase 0-1 overhead per 
-#* step (about 15-20 physics frames). But this is a training-speed optimization,
-#* not a correctness fix. Start with the lift approach; add heuristic reset 
-#* later if the overhead is too high.
-
-#! fix the issues here:
-# 1. RL correctness issues
-# 2. build_vision_observation() combines targets from every environment into one goal image and then gives that same image to every environment. Each environment needs its own goal contour.
-# 3. The Q-map used for action selection is conditioned on the spatial mean of the action parameters, while critic training conditions it on the selected pixel’s executed parameters. Those are different definitions of \(Q(s,a)\).
-# 4. FiLM parameters belong to both optimizers and are updated by the actor loss. This lets the critic itself change to increase its output instead of optimizing only the actor parameters.
-# 5. Completed environments continue receiving actions until all environments succeed. They can collect repeated success bonuses and later become unsuccessful again.
-# 6. The clipped reward max(0, d_before-d_after) permits reward farming by repeatedly moving away and back toward the target.
-# 7. global_step increases by 12. Therefore % TRAIN_EVERY with TRAIN_EVERY=4 is always true, while % 5000 only becomes true every 15,000 transitions.
-# 8. Empty contour masks lead to a bogus (0,0) action or a target Q-value of -inf.
-# 9. Strike and standoff targets are not clipped to the prismatic joint limits.

@@ -155,17 +155,24 @@ class SpatialActorCritic(nn.Module):
         super().__init__()
         c = base_channels
 
+        #! shared backbone for both critic and actor
         self.unet = UNet(in_channels=in_channels, base_channels=c)
-        self.param_head = nn.Conv2d(c, 3, 1)          # raw (d̑_x, d̑_y, Δd)
-        self.film = FiLM(param_dim=3, feature_dim=c, hidden_dim=64)
+        
+        #! critic 
         self.q_head = nn.Conv2d(c, 1, 1)              # per-pixel Q
+        self.film = FiLM(param_dim=3, feature_dim=c, hidden_dim=64)
+
+        #! actor
+        self.param_head = nn.Conv2d(c, 3, 1)          # raw (d̑_x, d̑_y, Δd)
         self.delta_d_max = delta_d_max
 
     #* -- helpers -------------------------------------------------------
 
+    #! bound the action params to valid ranges
     def _activate_params(self, raw: torch.Tensor) -> torch.Tensor:
-        """Apply tanh/sigmoid to raw param output."""
+        """Apply tanh/sigmoid to raw param output; normalise direction."""
         d_xy  = torch.tanh(raw[:, :2])                    # (B, 2, H, W) in [-1, 1]
+        d_xy  = F.normalize(d_xy, dim=1, eps=1e-6)       # unit length per pixel
         delta = torch.sigmoid(raw[:, 2:]) * self.delta_d_max  # (B, 1, H, W)
         return torch.cat([d_xy, delta], dim=1)          # (B, 3, H, W)
 
@@ -188,14 +195,13 @@ class SpatialActorCritic(nn.Module):
     #* -- forward -------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Full forward pass; FiLM uses contour-masked spatial mean of params."""
+        """Full forward pass; FiLM uses contour-masked spatial mean of params.
+        Used for TD target pixel selection in train_step (cheap ranking before
+        per-pixel re-evaluation) and get_values_at_pixel convenience."""
         f = self.unet.get_features(x)              # (B, C, H, W)
         params_raw = self.param_head(f)            # (B, 3, H, W)
         params = self._activate_params(params_raw) # (B, 3, H, W)
 
-        #! The argmax pixel is still selected via the cheap mean-conditioned 
-        #! Q (a heuristic), then re-evaluated with specific-param conditioning 
-        #! for the actual target value. 
         # contour-masked mean — only object pixels contribute to FiLM
         contour_mask = (x[:, 0:1] > 0.0).float()   # (B, 1, H, W)
         counts = contour_mask.sum(dim=[-2, -1]).clamp(min=1)  # (B, 1)
@@ -244,6 +250,70 @@ class SpatialActorCritic(nn.Module):
         q_vals = q_map[batch_idx, 0, pixel_ij[:, 0], pixel_ij[:, 1]]  # (B,)
         p_vals = self.params_at_pixel(params, pixel_ij)                # (B, 3)
         return q_vals, p_vals
+
+    def greedy_pixel(
+        self,
+        f: torch.Tensor,                 # (B, C, H, W) — pre-computed U-Net features
+        params: torch.Tensor,            # (B, 3, H, W) — per-pixel action params
+        contour_mask: torch.Tensor,      # (B, H, W) bool
+        top_k: int = 5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-pixel FiLM-conditioned greedy pixel selection.
+
+        Ranks pixels by cheap mean-conditioned Q, then re-evaluates the
+        top-K with each pixel's own action params via per-pixel FiLM.
+        One U-Net pass is assumed (caller provides f).
+
+        Note: this is exact only when top_k ≥ all contour pixels.
+        With typical top_k=5 it is an approximation — the globally best
+        per-pixel conditioned pixel is found if it ranks in the top-K
+        mean-conditioned candidates, which is empirically nearly always true.
+
+        Returns:
+          pixels: (B, 2) long — (row, col) of best pixel per batch item
+          q_vals: (B,)  float — per-pixel conditioned Q at winning pixel
+        """
+        B, C, H, W = f.shape
+        batch_idx = torch.arange(B, device=f.device)
+
+        # cheap mean-conditioned Q for candidate ranking
+        mask_f = contour_mask.unsqueeze(1).float()
+        counts = mask_f.sum(dim=[-2, -1]).clamp(min=1)
+        params_mean = (params * mask_f).sum(dim=[-2, -1]) / counts  # (B, 3)
+        gamma_m, beta_m = self.film(params_mean)
+        f_mean = gamma_m[:, :, None, None] * f + beta_m[:, :, None, None]
+        q_mean = self.q_head(f_mean).squeeze(1)                    # (B, H, W)
+        q_mean[~contour_mask] = -float("inf")
+
+        # top-K candidates per batch item
+        q_flat = q_mean.view(B, -1)                               # (B, H*W)
+        candidates = min(top_k, contour_mask.sum(dim=(-2, -1)).max().item())
+        _, topk_idx = torch.topk(q_flat, candidates, dim=1)       # (B, K)
+        topk_row = topk_idx // W                                   # (B, K)
+        topk_col = topk_idx % W                                    # (B, K)
+
+        best_q = torch.full((B,), -float("inf"), device=f.device)
+        best_row = torch.zeros(B, dtype=torch.long, device=f.device)
+        best_col = torch.zeros(B, dtype=torch.long, device=f.device)
+
+        for k in range(candidates):
+            row = topk_row[:, k]                                    # (B,)
+            col = topk_col[:, k]                                    # (B,)
+            pixel_params = params[batch_idx, :, row, col]           # (B, 3)
+            gamma, beta = self.film(pixel_params)                   # (B, C)
+            f_mod = gamma[:, :, None, None] * f + beta[:, :, None, None]
+            q_cand = self.q_head(f_mod)                             # (B, 1, H, W)
+            q_val = q_cand[batch_idx, 0, row, col]                 # (B,)
+            valid = contour_mask[batch_idx, row, col]
+            q_val = q_val.masked_fill(~valid, -float("inf"))
+
+            better = q_val > best_q
+            best_q[better] = q_val[better]
+            best_row[better] = row[better]
+            best_col[better] = col[better]
+
+        pixels = torch.stack([best_row, best_col], dim=1)          # (B, 2)
+        return pixels, best_q
 
 
 #! FiLM (Feature-wise Linear Modulation) is a conditioning technique from paper:

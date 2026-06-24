@@ -766,13 +766,10 @@ def build_vision_observation(
             segmentation_to_contour_current(seg_maps[env_idx])
         )
 
-        # per-env goal contour — each env renders its own targets in its local frame
-        offset = env_root_pos[env_idx, :2] if env_root_pos is not None else np.zeros(2)
+        # per-env goal contour — targets are already env-local, no offset needed
         env_targets = {}
         for name, tpos in target_positions.items():
-            shifted = tpos[env_idx:env_idx + 1].copy()
-            shifted[:, :2] -= offset
-            env_targets[name] = shifted
+            env_targets[name] = tpos[env_idx:env_idx + 1].copy()
         env_oris = {name: ori[env_idx:env_idx + 1]
                     for name, ori in target_orientations.items()}
         contour_goals.append(
