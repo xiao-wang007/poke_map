@@ -77,7 +77,14 @@ CYLINDER_LOCAL_POSITION: list = [
     OBJECT_HEIGHT * 0.5,
 ]
 
-RANDOMIZE_ON_START: bool = SCENE_CONFIG["randomize_on_start"]
+RANDOMIZE_OBJECTS_ON_START: bool = SCENE_CONFIG.get(
+    "randomize_objects_on_start",
+    SCENE_CONFIG.get("randomize_on_start", True),
+)
+RANDOMIZE_STRIKER_MASSES_ON_START: bool = SCENE_CONFIG.get(
+    "randomize_striker_masses_on_start",
+    False,
+)
 RANDOM_SEED: int = SCENE_CONFIG["random_seed"]
 
 L_POSITION_AREA_MIN: list = OBJECT_CONFIG["l_position_area_min"]
@@ -515,13 +522,14 @@ def main():
     #* ── Randomize initial poses & striker masses ────────────────────
     randomized_poses = None
     randomized_striker_masses = None
-    if RANDOMIZE_ON_START:
+    if RANDOMIZE_OBJECTS_ON_START:
         randomized_poses = randomize_object_poses(
             env_roots=env_roots,
             l_objects=l_objects,
             cylinder_objects=cylinder_objects,
             seed=RANDOM_SEED,
         )
+    if RANDOMIZE_STRIKER_MASSES_ON_START:
         randomized_striker_masses = randomize_striker_masses(
             strikers=strikers, seed=RANDOM_SEED + 1
         )

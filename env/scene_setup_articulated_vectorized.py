@@ -59,7 +59,14 @@ CYLINDER_LOCAL_POSITION = [
     OBJECT_HEIGHT * 0.5,
 ]
 
-RANDOMIZE_ON_START = SCENE_CONFIG["randomize_on_start"]
+RANDOMIZE_OBJECTS_ON_START = SCENE_CONFIG.get(
+    "randomize_objects_on_start",
+    SCENE_CONFIG.get("randomize_on_start", True),
+)
+RANDOMIZE_FINGER_PROPERTIES_ON_START = SCENE_CONFIG.get(
+    "randomize_finger_properties_on_start",
+    False,
+)
 RANDOM_SEED = SCENE_CONFIG["random_seed"]
 
 L_POSITION_AREA_MIN = OBJECT_CONFIG["l_position_area_min"]
@@ -457,13 +464,14 @@ def main():
 
     randomized_poses = None
     randomized_finger_properties = None
-    if RANDOMIZE_ON_START:
+    if RANDOMIZE_OBJECTS_ON_START:
         randomized_poses = randomize_object_poses(
             env_roots=env_roots,
             l_objects=l_objects,
             cylinder_objects=cylinder_objects,
             seed=RANDOM_SEED,
         )
+    if RANDOMIZE_FINGER_PROPERTIES_ON_START:
         randomized_finger_properties = randomize_finger_properties(
             finger_articulations=finger_articulations,
             finger_tip_links=finger_tip_links,
@@ -531,4 +539,3 @@ if __name__ == "__main__":
 #!     ├── env_1/FingerRobot  ← articulation instance 1
 #!     ├── env_2/FingerRobot  ← articulation instance 2
 #! ---------------------------------------------------------------------------
-

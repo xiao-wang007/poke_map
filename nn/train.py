@@ -56,11 +56,13 @@ try:
     import isaacsim.core.experimental.utils.app as app_utils
     import isaacsim.core.experimental.utils.stage as stage_utils
     from omni.kit.async_engine import run_coroutine
-    from pxr import Gf, UsdGeom
+    from pxr import Gf, Sdf, UsdGeom, UsdShade
     _HAS_ISAAC = True
 except ModuleNotFoundError:
     Gf = None
+    Sdf = None
     UsdGeom = None
+    UsdShade = None
     stage_utils = None
     _HAS_ISAAC = False
 
@@ -71,6 +73,8 @@ from vision.camera import (
     get_camera_intrinsics,
     get_object_poses_vectorized,
     build_vision_observation,
+    get_object_masks_2d,
+    mask_to_contour,
     pixel_to_world,
 )
 from nn.networks import SpatialActorCritic
@@ -80,6 +84,7 @@ from env.scene_setup_articulated_vectorized import randomize_object_poses
 CONFIG = load_config()
 SCENE_CONFIG = CONFIG["scene"]
 FINGER_CONFIG = CONFIG["finger"]
+WORKSPACE_CONFIG = CONFIG["workspace"]
 
 OBJECT_HEIGHT = SCENE_CONFIG["object_height"]
 L_ARM_LENGTH = SCENE_CONFIG["l_arm_length"]
@@ -110,13 +115,16 @@ MAX_STEPS: int = 30              # max pokes per episode
 C_STEP: float = 0.01             # per-step penalty
 C_SUCCESS: float = 10.0          # terminal success bonus
 SUCCESS_THRESHOLD: float = 0.02  # metres — tolerance to target
+STOP_POKE_THRESHOLD: float = 0.035  # metres — stop touching near-target envs
 DELTA_D_MAX: float = 0.2          # max standoff (m)
-IMPACT_STEPS: int = 40            # physics steps per strike (k_p=200, m≈2 kg)
+IMPACT_STEPS: int = 80            # physics steps holding the strike command
 FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
 STANDOFF_CLEARANCE: float = 0.01  # gap between fingertip sphere and object
-OVERTRAVEL: float = 0.005         # extra sphere penetration past first contact
+OVERTRAVEL: float = 0.1          # extra sphere penetration past first contact
+STRIKE_SPEED: float = 0.15        # m/s velocity target during impact
 POKE_Z: float = OBJECT_HEIGHT * 0.5  # side-poke height at object midline
 SAFE_Z: float = POKE_Z
+FINGER_TRACK_TOL: float = 0.003   # metres — phase target convergence tolerance
 
 # yaw training controls
 # Stage A: keep target yaw equal to current yaw, softly discourage yaw drift,
@@ -139,8 +147,15 @@ DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 CHECKPOINT_EVERY: int = 100       # episodes between saves
 CHECKPOINT_KEEP: int = 3          # how many recent checkpoints to keep
+SHOW_PLANE_OVERLAY: bool = True   # draw workspace/camera view footprints
+PLANE_OVERLAY_THICKNESS: float = 0.003
+PLANE_OVERLAY_OPACITY: float = 0.18
 SHOW_TARGET_OVERLAY: bool = True  # draw per-env target poses in the USD scene
-TARGET_OVERLAY_Z_OFFSET: float = 0.003
+TARGET_OVERLAY_Z_OFFSET: float = 0.015
+TARGET_OVERLAY_THICKNESS: float = 0.006
+TARGET_OVERLAY_OPACITY: float = 0.2
+SHOW_ACTION_OVERLAY: bool = True  # draw selected poke standoff/contact/strike
+ACTION_OVERLAY_Z_OFFSET: float = 0.01
 
 
 #* ================================================================
@@ -297,12 +312,59 @@ def _set_local_transform(path: str, translation, yaw: float = 0.0, scale=None):
     xform_op.Set(mat * rot * trans)
 
 
-def _set_display_color(prim, color_rgb):
+def _set_display_color(prim, color_rgb, opacity: float | None = None):
     gprim = UsdGeom.Gprim(prim)
-    attr = gprim.GetDisplayColorAttr()
-    if not attr.IsValid():
-        attr = gprim.CreateDisplayColorAttr()
-    attr.Set([Gf.Vec3f(float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))])
+    color_attr = gprim.GetDisplayColorAttr()
+    if not color_attr.IsValid():
+        color_attr = gprim.CreateDisplayColorAttr()
+    color_attr.Set([Gf.Vec3f(float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))])
+    if opacity is not None:
+        opacity_attr = gprim.GetDisplayOpacityAttr()
+        if not opacity_attr.IsValid():
+            opacity_attr = gprim.CreateDisplayOpacityAttr()
+        opacity_attr.Set([float(opacity)])
+
+
+def _remove_if_type_mismatch(stage, path: str, type_name: str):
+    prim = stage.GetPrimAtPath(path)
+    if prim.IsValid() and prim.GetTypeName() != type_name:
+        stage.RemovePrim(path)
+
+
+def _define_colored_cube(stage, path: str, color_rgb, opacity: float | None = None):
+    _remove_if_type_mismatch(stage, path, "Cube")
+    cube = UsdGeom.Cube.Define(stage, path)
+    cube.CreateSizeAttr(1.0)
+    _set_display_color(cube.GetPrim(), color_rgb, opacity=opacity)
+    return cube
+
+
+def _define_colored_sphere(stage, path: str, radius: float, color_rgb,
+                           opacity: float | None = None):
+    _remove_if_type_mismatch(stage, path, "Sphere")
+    sphere = UsdGeom.Sphere.Define(stage, path)
+    sphere.CreateRadiusAttr(float(radius))
+    _set_display_color(sphere.GetPrim(), color_rgb, opacity=opacity)
+    return sphere
+
+
+def _transparent_material(stage, path: str, color_rgb, opacity: float):
+    material = UsdShade.Material.Define(stage, path)
+    shader = UsdShade.Shader.Define(stage, f"{path}/PreviewSurface")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+        Gf.Vec3f(float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))
+    )
+    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(opacity))
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
+    material.CreateSurfaceOutput().ConnectToSource(
+        shader.ConnectableAPI(), "surface"
+    )
+    return material
+
+
+def _bind_material(prim, material):
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
 
 
 def update_target_overlay(targets_pos: dict[str, np.ndarray],
@@ -312,11 +374,19 @@ def update_target_overlay(targets_pos: dict[str, np.ndarray],
         return
 
     stage = stage_utils.get_current_stage(backend="usd")
+    l_target_mat = _transparent_material(
+        stage, "/VisualMaterials/target_overlay_l_blue",
+        (0.1, 0.35, 1.0), TARGET_OVERLAY_OPACITY
+    )
+    cyl_target_mat = _transparent_material(
+        stage, "/VisualMaterials/target_overlay_cylinder_orange",
+        (1.0, 0.45, 0.05), TARGET_OVERLAY_OPACITY
+    )
     for env_idx in range(NUM_ENVS):
         overlay_root = f"{ENVS_ROOT_PATH}/env_{env_idx}/TargetOverlay"
         _ensure_xform(stage, overlay_root)
 
-        # L target: two green translucent-looking guide bars, parented under
+        # L target: blue transparent guide bars, parented under
         # an oriented target xform matching the rendered goal contour.
         l_path = f"{overlay_root}/LObjectTarget"
         _ensure_xform(stage, l_path)
@@ -328,35 +398,273 @@ def update_target_overlay(targets_pos: dict[str, np.ndarray],
 
         l_parts = {
             "VerticalLeg": (
-                [L_THICKNESS * 0.5, L_ARM_LENGTH * 0.5, OBJECT_HEIGHT * 0.5],
-                [L_THICKNESS, L_ARM_LENGTH, OBJECT_HEIGHT],
+                [L_THICKNESS * 0.5, L_ARM_LENGTH * 0.5, TARGET_OVERLAY_THICKNESS * 0.5],
+                [L_THICKNESS, L_ARM_LENGTH, TARGET_OVERLAY_THICKNESS],
             ),
             "HorizontalLeg": (
-                [L_ARM_LENGTH * 0.5, L_THICKNESS * 0.5, OBJECT_HEIGHT * 0.5],
-                [L_ARM_LENGTH, L_THICKNESS, OBJECT_HEIGHT],
+                [L_ARM_LENGTH * 0.5, L_THICKNESS * 0.5, TARGET_OVERLAY_THICKNESS * 0.5],
+                [L_ARM_LENGTH, L_THICKNESS, TARGET_OVERLAY_THICKNESS],
             ),
         }
         for part_name, (center, scale) in l_parts.items():
             part_path = f"{l_path}/{part_name}"
-            cube = UsdGeom.Cube.Define(stage, part_path)
-            cube.CreateSizeAttr(1.0)
-            _set_display_color(cube.GetPrim(), (0.0, 1.0, 0.15))
+            cube = _define_colored_cube(
+                stage, part_path, (0.1, 0.35, 1.0), opacity=TARGET_OVERLAY_OPACITY
+            )
+            _bind_material(cube.GetPrim(), l_target_mat)
             _set_local_transform(part_path, center, scale=scale)
 
-        # Cylinder target: yellow guide disk at target center.
+        # Cylinder target: orange transparent guide disk at target center.
         cyl_path = f"{overlay_root}/CylinderTarget"
+        _remove_if_type_mismatch(stage, cyl_path, "Cylinder")
         cyl = UsdGeom.Cylinder.Define(stage, cyl_path)
         cyl.CreateRadiusAttr(CYLINDER_RADIUS)
-        cyl.CreateHeightAttr(OBJECT_HEIGHT)
-        _set_display_color(cyl.GetPrim(), (1.0, 0.95, 0.0))
+        cyl.CreateHeightAttr(TARGET_OVERLAY_THICKNESS)
+        _set_display_color(
+            cyl.GetPrim(), (1.0, 0.45, 0.05), opacity=TARGET_OVERLAY_OPACITY
+        )
+        _bind_material(cyl.GetPrim(), cyl_target_mat)
         cyl_pos = targets_pos["Cylinder"][env_idx].copy()
-        cyl_pos[2] = OBJECT_HEIGHT * 0.5 + TARGET_OVERLAY_Z_OFFSET
+        cyl_pos[2] = TARGET_OVERLAY_Z_OFFSET + TARGET_OVERLAY_THICKNESS * 0.5
         _set_local_transform(cyl_path, cyl_pos)
+
+
+def update_plane_overlays(K: np.ndarray):
+    """Draw workspace and camera-view footprints under each env root."""
+    if not SHOW_PLANE_OVERLAY or not _HAS_ISAAC:
+        return
+
+    stage = stage_utils.get_current_stage(backend="usd")
+    workspace_mat = _transparent_material(
+        stage, "/VisualMaterials/workspace_overlay_green",
+        (0.0, 1.0, 0.1), PLANE_OVERLAY_OPACITY
+    )
+    camera_mat = _transparent_material(
+        stage, "/VisualMaterials/camera_view_overlay_gray",
+        (0.45, 0.45, 0.45), PLANE_OVERLAY_OPACITY
+    )
+
+    wx_min = float(WORKSPACE_CONFIG.get("x_min", -0.30))
+    wx_max = float(WORKSPACE_CONFIG.get("x_max", 0.30))
+    wy_min = float(WORKSPACE_CONFIG.get("y_min", -0.30))
+    wy_max = float(WORKSPACE_CONFIG.get("y_max", 0.30))
+    workspace_center = [(wx_min + wx_max) * 0.5, (wy_min + wy_max) * 0.5, 0.002]
+    workspace_scale = [wx_max - wx_min, wy_max - wy_min, PLANE_OVERLAY_THICKNESS]
+
+    H, W = RESOLUTION
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    camera_x_min = (0.0 - cx) / fx
+    camera_x_max = ((W - 1.0) - cx) / fx
+    camera_y_min = (0.0 - cy) / fy
+    camera_y_max = ((H - 1.0) - cy) / fy
+    camera_center = [
+        (camera_x_min + camera_x_max) * 0.5,
+        (camera_y_min + camera_y_max) * 0.5,
+        0.001,
+    ]
+    camera_scale = [
+        camera_x_max - camera_x_min,
+        camera_y_max - camera_y_min,
+        PLANE_OVERLAY_THICKNESS,
+    ]
+
+    for env_idx in range(NUM_ENVS):
+        overlay_root = f"{ENVS_ROOT_PATH}/env_{env_idx}/PlaneOverlay"
+        _ensure_xform(stage, overlay_root)
+
+        camera_path = f"{overlay_root}/CameraView"
+        camera_cube = _define_colored_cube(
+            stage, camera_path, (0.45, 0.45, 0.45), opacity=PLANE_OVERLAY_OPACITY
+        )
+        _bind_material(camera_cube.GetPrim(), camera_mat)
+        _set_local_transform(camera_path, camera_center, scale=camera_scale)
+
+        workspace_path = f"{overlay_root}/Workspace"
+        workspace_cube = _define_colored_cube(
+            stage, workspace_path, (0.0, 1.0, 0.1), opacity=PLANE_OVERLAY_OPACITY
+        )
+        _bind_material(workspace_cube.GetPrim(), workspace_mat)
+        _set_local_transform(workspace_path, workspace_center, scale=workspace_scale)
+
+
+def update_action_overlay(pixel_ij: np.ndarray,
+                          d_xy: np.ndarray,
+                          delta_d: np.ndarray,
+                          K: np.ndarray,
+                          active: np.ndarray | None = None):
+    """Draw the selected side-poke action for each env."""
+    if not SHOW_ACTION_OVERLAY or not _HAS_ISAAC:
+        return
+
+    stage = stage_utils.get_current_stage(backend="usd")
+    dir_norm = np.linalg.norm(d_xy, axis=1, keepdims=True)
+    dir_norm = np.where(dir_norm < 1e-8, 1.0, dir_norm)
+    dirs = d_xy / dir_norm
+    min_standoff = FINGERTIP_RADIUS + STANDOFF_CLEARANCE
+    delta_d_clipped = np.clip(delta_d, min_standoff, DELTA_D_MAX)
+
+    marker_radius = 0.01
+    line_thickness = 0.004
+    z = POKE_Z + ACTION_OVERLAY_Z_OFFSET
+
+    for env_idx in range(NUM_ENVS):
+        overlay_root = f"{ENVS_ROOT_PATH}/env_{env_idx}/ActionOverlay"
+        _ensure_xform(stage, overlay_root)
+
+        if active is not None and not bool(active[env_idx]):
+            _set_local_transform(overlay_root, [0.0, 0.0, -10.0])
+            continue
+        _set_local_transform(overlay_root, [0.0, 0.0, 0.0])
+        old_strike = stage.GetPrimAtPath(f"{overlay_root}/Strike")
+        if old_strike.IsValid():
+            stage.RemovePrim(f"{overlay_root}/Strike")
+
+        world = pixel_to_world(tuple(pixel_ij[env_idx]), K)
+        contact_xy = world[:2]
+        standoff_xy = contact_xy - dirs[env_idx] * delta_d_clipped[env_idx]
+        sphere_contact_xy = contact_xy - dirs[env_idx] * FINGERTIP_RADIUS
+        strike_xy = sphere_contact_xy + dirs[env_idx] * OVERTRAVEL
+
+        points = {
+            "Standoff": (standoff_xy, (0.0, 0.25, 1.0)),
+            "Contact": (contact_xy, (1.0, 0.0, 0.0)),
+            "Overtravel": (strike_xy, (1.0, 1.0, 1.0)),
+        }
+        for name, (xy, color) in points.items():
+            path = f"{overlay_root}/{name}"
+            _define_colored_sphere(stage, path, marker_radius, color)
+            _set_local_transform(path, [xy[0], xy[1], z])
+
+        line_vec = strike_xy - standoff_xy
+        line_len = float(np.linalg.norm(line_vec))
+        if line_len > 1e-6:
+            line_center = 0.5 * (standoff_xy + strike_xy)
+            line_yaw = float(np.arctan2(line_vec[1], line_vec[0]))
+            line_path = f"{overlay_root}/Path"
+            _define_colored_cube(stage, line_path, (0.0, 1.0, 1.0))
+            _set_local_transform(
+                line_path,
+                [line_center[0], line_center[1], z],
+                yaw=line_yaw,
+                scale=[line_len, line_thickness, line_thickness],
+            )
 
 
 #* ================================================================
 #*  Action selection
 #* ================================================================
+
+def _mask_center(mask: torch.Tensor) -> np.ndarray | None:
+    pixels = torch.nonzero(mask, as_tuple=False)
+    if pixels.numel() == 0:
+        return None
+    return pixels.to(torch.float32).mean(dim=0).cpu().numpy()
+
+
+def _pixels_to_local_xy(pixel_ij: np.ndarray, K: np.ndarray) -> np.ndarray:
+    pixels = np.asarray(pixel_ij, dtype=np.float32)
+    rows = pixels[:, 0]
+    cols = pixels[:, 1]
+    x = (cols - K[0, 2]) / K[0, 0]
+    y = (rows - K[1, 2]) / K[1, 1]
+    return np.stack([x, y], axis=1).astype(np.float32)
+
+
+def _normalise_xy(v: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
+    norm = float(np.linalg.norm(v))
+    if norm < 1e-8:
+        if fallback is not None:
+            return fallback.astype(np.float32)
+        angle = np.random.uniform(-np.pi, np.pi)
+        return np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+    return (v / norm).astype(np.float32)
+
+
+def heuristic_poke_actions(
+    contour_masks: torch.Tensor,
+    poses_before: dict,
+    targets_pos: dict[str, np.ndarray],
+    env_root_pos: np.ndarray,
+    K: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Physically plausible exploration pokes for epsilon actions.
+
+    Pick the object that is farther from its target, choose a contour pixel on
+    the backside relative to target displacement, and push toward the target.
+    """
+    B = contour_masks.shape[0]
+    pixel_ij = np.zeros((B, 2), dtype=np.int32)
+    d_xy = np.zeros((B, 2), dtype=np.float32)
+    delta_d = np.full(B, 0.05, dtype=np.float32)
+
+    masks_cpu = contour_masks.detach().cpu()
+    env_offsets = env_root_pos[:, :2]
+
+    for b in range(B):
+        valid_pixels_t = torch.nonzero(masks_cpu[b], as_tuple=False)
+        if valid_pixels_t.numel() == 0:
+            continue
+
+        object_infos = []
+        for obj_name, target in targets_pos.items():
+            current_xy = poses_before[obj_name][0][b, :2] - env_offsets[b]
+            target_xy = target[b, :2]
+            to_target = target_xy - current_xy
+            dist = float(np.linalg.norm(to_target))
+            object_infos.append((dist, obj_name, current_xy, target_xy, to_target))
+
+        movable_infos = [info for info in object_infos if info[0] >= STOP_POKE_THRESHOLD]
+        if not movable_infos:
+            movable_infos = object_infos
+        _, obj_name, current_xy, _, to_target = max(movable_infos, key=lambda item: item[0])
+        goal_dir = _normalise_xy(to_target)
+
+        local_position = poses_before[obj_name][0][b:b + 1].copy()
+        local_position[:, :2] -= env_offsets[b]
+        object_mask = get_object_masks_2d(
+            object_name=obj_name,
+            object_positions=local_position,
+            object_orientations=poses_before[obj_name][1][b:b + 1],
+            K=K,
+            resolution=RESOLUTION,
+        )[0]
+        object_contour, _ = mask_to_contour(object_mask)
+        valid_pixels = np.argwhere(object_contour).astype(np.int32)
+        if valid_pixels.shape[0] == 0:
+            valid_pixels = valid_pixels_t.numpy().astype(np.int32)
+        contact_xys = _pixels_to_local_xy(valid_pixels, K)
+
+        if obj_name == "Cylinder":
+            desired_contact_xy = current_xy - goal_dir * CYLINDER_RADIUS
+            nearest = int(np.argmin(np.linalg.norm(contact_xys - desired_contact_xy[None, :], axis=1)))
+            pixel_ij[b] = valid_pixels[nearest]
+            noisy_dir = goal_dir + np.random.randn(2).astype(np.float32) * 0.05
+            d_xy[b] = _normalise_xy(noisy_dir, fallback=goal_dir)
+            delta_d[b] = np.float32(0.045 + abs(np.random.randn()) * 0.015)
+            continue
+
+        inward_scores = (current_xy[None, :] - contact_xys) @ goal_dir
+        candidate_mask = inward_scores > 0.0
+        candidate_pixels = valid_pixels[candidate_mask]
+        candidate_xys = contact_xys[candidate_mask]
+
+        if candidate_pixels.shape[0] == 0:
+            candidate_pixels = valid_pixels
+            candidate_xys = contact_xys
+
+        backside_scores = (candidate_xys - current_xy[None, :]) @ (-goal_dir)
+        k = min(25, candidate_pixels.shape[0])
+        top_idx = np.argpartition(backside_scores, -k)[-k:]
+        chosen = int(np.random.choice(top_idx))
+
+        pixel_ij[b] = candidate_pixels[chosen]
+        noisy_dir = goal_dir + np.random.randn(2).astype(np.float32) * 0.10
+        d_xy[b] = _normalise_xy(noisy_dir, fallback=goal_dir)
+        delta_d[b] = np.float32(0.045 + abs(np.random.randn()) * 0.015)
+
+    return pixel_ij, d_xy, delta_d
+
 
 def select_action(
     actor_critic: SpatialActorCritic,
@@ -364,12 +672,15 @@ def select_action(
     contour_masks: torch.Tensor,           # (B, H, W) bool
     epsilon: float,
     noise_std: float,
+    heuristic_actions: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     top_k: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Select actions for a batch of observations.
 
     Greedy envs use per-pixel FiLM-conditioned pixel selection (top-K
-    re-evaluation).  ε-greedy envs pick a random valid pixel.
+    re-evaluation).  ε-greedy envs use the provided heuristic action prior
+    when available, so early exploration produces meaningful pushes instead
+    of untrained param-head thrashing.
 
     Returns
     -------
@@ -398,21 +709,26 @@ def select_action(
                 continue
 
             if np.random.random() < epsilon:
-                # ε-greedy: random valid pixel
-                valid = torch.nonzero(contour_masks[b], as_tuple=True)
-                r = np.random.randint(len(valid[0]))
-                pixel_ij[b, 0] = valid[0][r].item()
-                pixel_ij[b, 1] = valid[1][r].item()
+                if heuristic_actions is not None:
+                    h_pixel, h_dxy, h_delta = heuristic_actions
+                    pixel_ij[b] = h_pixel[b]
+                    d_noisy = h_dxy[b]
+                    dd_noisy = h_delta[b]
+                else:
+                    valid = torch.nonzero(contour_masks[b], as_tuple=True)
+                    r = np.random.randint(len(valid[0]))
+                    pixel_ij[b, 0] = valid[0][r].item()
+                    pixel_ij[b, 1] = valid[1][r].item()
+                    d_noisy = np.random.randn(2).astype(np.float32)
+                    dd_noisy = 0.05 + abs(np.float32(np.random.randn())) * 0.02
             else:
                 # greedy: pre-computed per-pixel-conditioned best pixel
                 pixel_ij[b, 0] = greedy_pix[b, 0].item()
                 pixel_ij[b, 1] = greedy_pix[b, 1].item()
-
-            # read params at selected pixel
-            p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
-
-            d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
-            dd_noisy = p[2] + abs(np.float32(np.random.randn())) * noise_std
+                # read params at selected pixel
+                p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
+                d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
+                dd_noisy = p[2] + abs(np.float32(np.random.randn())) * noise_std
 
             # clamp & normalise direction
             norm = np.linalg.norm(d_noisy) + 1e-8
@@ -511,6 +827,23 @@ def compute_rewards(
     return r, done, done_once
 
 
+def near_translation_targets(
+    poses: dict,
+    targets: dict,
+    env_root_pos: np.ndarray,
+    threshold: float = STOP_POKE_THRESHOLD,
+) -> np.ndarray:
+    """Return envs where all object centers are close enough to targets."""
+    num_envs = list(poses.values())[0][0].shape[0]
+    near = np.ones(num_envs, dtype=bool)
+    offset = env_root_pos[:, :2]
+    for obj_name, (positions, _) in poses.items():
+        local_xy = positions[:, :2].copy() - offset
+        dist = np.linalg.norm(local_xy - targets[obj_name][:, :2], axis=1)
+        near &= dist < threshold
+    return near
+
+
 #* ================================================================
 #*  Environment step — articulated finger (batched, all envs)
 #* ================================================================
@@ -564,34 +897,60 @@ async def env_step_async(
     strike_xy = contact_xy + dirs * OVERTRAVEL
 
     #* ── snap initial positions (inactive envs hold these throughout) ──
-    q_cur = as_numpy(fingers.get_dof_positions()).copy()     # (B, 3)
+    try:
+        q_cur = as_numpy(fingers.get_dof_positions()).copy()     # (B, 3)
+    except AssertionError:
+        app_utils.play()
+        await _step_physics(2)
+        q_cur = as_numpy(fingers.get_dof_positions()).copy()
 
     def _hold_inactive(targets: np.ndarray):
         if active is not None:
             targets[~active] = q_cur[~active]
 
+    async def _drive_to(targets: np.ndarray, max_steps: int,
+                        tol: float = FINGER_TRACK_TOL):
+        fingers.set_dof_position_targets(positions=targets.tolist(), dof_indices=dof_indices)
+        fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
+        if active is not None and not np.any(active):
+            await _step_physics(1)
+            return
+        for step_idx in range(max_steps):
+            await _step_physics(1)
+            try:
+                q_now = as_numpy(fingers.get_dof_positions())
+            except AssertionError:
+                app_utils.play()
+                await _step_physics(2)
+                try:
+                    q_now = as_numpy(fingers.get_dof_positions())
+                except AssertionError:
+                    await _step_physics(max(0, max_steps - step_idx - 1))
+                    break
+            err = np.linalg.norm(q_now - targets, axis=1)
+            if active is not None:
+                err = err[active]
+            if err.size > 0 and float(np.max(err)) <= tol:
+                break
+
     #* ── Phase 0: move to side-poke height above current XY ──────────
     q0 = q_cur.copy()
     q0[:, 2] = POKE_Z
     _hold_inactive(q0)
-    fingers.set_dof_position_targets(positions=q0.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(25)
+    await _drive_to(q0, max_steps=60)
 
     #* ── Phase 1: move to standoff at side-poke height ──────────────
     q1 = np.zeros((B, 3), dtype=np.float32)
     q1[:, :2] = np.clip(standoff_xy, xy_low, xy_high)
     q1[:, 2] = POKE_Z
     _hold_inactive(q1)
-    fingers.set_dof_position_targets(positions=q1.tolist(), dof_indices=dof_indices)
-    await _step_physics(40)
+    await _drive_to(q1, max_steps=120)
 
     #* ── Phase 2: hold standoff before impact ───────────────────────
     q2 = q1.copy()
     q2[:, 2] = POKE_Z
     _hold_inactive(q2)
-    fingers.set_dof_position_targets(positions=q2.tolist(), dof_indices=dof_indices)
-    await _step_physics(20)
+    await _drive_to(q2, max_steps=30)
 
     #* ── Phase 3: strike — push OVERTRAVEL past contact ──────────────
     #* Position-only PD (v_target=0) — OVERTRAVEL creates a steady
@@ -602,17 +961,20 @@ async def env_step_async(
     q3[:, 2] = POKE_Z
     _hold_inactive(q3)
 
+    strike_v = np.zeros((B, 3), dtype=np.float32)
+    strike_v[:, :2] = dirs * STRIKE_SPEED
+    if active is not None:
+        strike_v[~active] = 0.0
     fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
+    fingers.set_dof_velocity_targets(velocities=strike_v.tolist(), dof_indices=dof_indices)
     await _step_physics(IMPACT_STEPS)
+    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
 
     #* ── Phase 4: retract back to standoff at side-poke height ───────
     q4 = q2.copy()
     q4[:, 2] = POKE_Z
     _hold_inactive(q4)
-    fingers.set_dof_position_targets(positions=q4.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(20)
+    await _drive_to(q4, max_steps=80)
 
     #* ── Phase 5: settle briefly, then clear residual object velocities ─
     SETTLE_STEPS = 30
@@ -774,7 +1136,7 @@ class Trainer:
     async def setup(self):
         """Async init — starts sim, gets handles, configures drives."""
         await ensure_sim_running_async()
-        self.fingers, self.tips, self.env_roots = get_finger_handles()
+        self.refresh_scene_handles()
 
         finger_props = globals().get("randomized_finger_properties",
                         getattr(__main__, "randomized_finger_properties", None))
@@ -786,6 +1148,11 @@ class Trainer:
             configure_drives(self.fingers)
 
         self.K = get_camera_intrinsics()
+        update_plane_overlays(self.K)
+
+    def refresh_scene_handles(self):
+        """Recreate Isaac wrappers after stage/timeline reinitialization."""
+        self.fingers, self.tips, self.env_roots = get_finger_handles()
 
     def _decay_schedule(self, episode: int):
         frac = min(1.0, episode / EPS_DECAY)
@@ -796,14 +1163,26 @@ class Trainer:
     #! Reset 
     async def _reset_episode(self, episode: int) -> tuple[torch.Tensor, list, torch.Tensor, dict]:
         """Randomise objects + targets, return first observation."""
+        self.refresh_scene_handles()
+
         #* RigidPrim handles (use same patterns as scene setup)
         l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
         cylinder_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
 
-        randomize_object_poses(
-            self.env_roots, l_objects, cylinder_objects,
-            seed=None,
-        )
+        try:
+            randomize_object_poses(
+                self.env_roots, l_objects, cylinder_objects,
+                seed=None,
+            )
+        except AssertionError:
+            await ensure_sim_running_async()
+            self.refresh_scene_handles()
+            l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
+            cylinder_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
+            randomize_object_poses(
+                self.env_roots, l_objects, cylinder_objects,
+                seed=None,
+            )
         # clear residual velocities from previous episode
         zero_vel = np.zeros((NUM_ENVS, 3), dtype=np.float32)
         zero_ang = np.zeros((NUM_ENVS, 3), dtype=np.float32)
@@ -860,18 +1239,33 @@ class Trainer:
         ep_len = 0
         active_counts = []
         ep_active_steps = 0
+        final_has_contour = np.ones(NUM_ENVS, dtype=bool)
 
         for step in range(MAX_STEPS):
             has_contour = contour_masks.any(dim=(-2, -1)).cpu().numpy()
+            final_has_contour = has_contour
+            near_target = near_translation_targets(
+                poses_before, self._targets_pos, self._env_root_pos
+            )
+            self._done_once |= near_target
             was_active = ~self._done_once & has_contour  # done OR invisible → frozen
             active_counts.append(int(was_active.sum()))
             ep_active_steps += int(was_active.sum())
 
             #* — select actions ——————————————————————————————
+            heuristic_actions = heuristic_poke_actions(
+                contour_masks,
+                poses_before,
+                self._targets_pos,
+                self._env_root_pos,
+                self.K,
+            )
             pixel_ij, d_xy, delta_d = select_action(
                 self.actor_critic, x, contour_masks,
                 self.epsilon, self.noise_std,
+                heuristic_actions=heuristic_actions,
             )
+            update_action_overlay(pixel_ij, d_xy, delta_d, self.K, active=was_active)
 
             #* — execute (only active envs move; inactive held frozen) —
             poses_after, _ = await env_step_async(
@@ -884,6 +1278,9 @@ class Trainer:
                 target_oris=self._targets_ori,
                 yaw_reward_enabled=YAW_REWARD_ENABLED,
                 yaw_success_enabled=YAW_SUCCESS_ENABLED)
+            self._done_once |= near_translation_targets(
+                poses_after, self._targets_pos, self._env_root_pos
+            )
             rewards[~was_active] = 0.0
 
             #* — observe next state ——————————————————————————
@@ -930,6 +1327,8 @@ class Trainer:
         self.ep_lengths.append(ep_len)
         self._last_active_counts = active_counts
         self._last_ep_active_steps = ep_active_steps
+        self._last_done_count = int(self._done_once.sum())
+        self._last_lost_count = int((~final_has_contour).sum())
 
         return ep_return, ep_len
 
@@ -938,6 +1337,8 @@ class Trainer:
         avg_l = np.mean(self.ep_lengths) if self.ep_lengths else 0.0
         active_counts = getattr(self, "_last_active_counts", [])
         active_steps = getattr(self, "_last_ep_active_steps", 0)
+        done_count = getattr(self, "_last_done_count", 0)
+        lost_count = getattr(self, "_last_lost_count", 0)
         r_per_active = ep_return / max(1, active_steps)
         active_summary = ""
         if active_counts:
@@ -948,7 +1349,8 @@ class Trainer:
             f"avg100_r={avg_r:7.2f}  avg100_len={avg_l:5.1f}  "
             f"r/active={r_per_active:7.4f}  "
             f"ε={self.epsilon:.3f}  σ={self.noise_std:.3f}  "
-            f"buf={self.buffer.size:6d}  dt={elapsed:.1f}s"
+            f"buf={self.buffer.size:6d}  dt={elapsed:.1f}s  "
+            f"done={done_count:2d}  lost={lost_count:2d}"
             f"{active_summary}"
         )
 
