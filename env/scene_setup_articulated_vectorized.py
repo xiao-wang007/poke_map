@@ -66,6 +66,8 @@ L_POSITION_AREA_MIN = OBJECT_CONFIG["l_position_area_min"]
 L_POSITION_AREA_MAX = OBJECT_CONFIG["l_position_area_max"]
 CYLINDER_POSITION_AREA_MIN = OBJECT_CONFIG["cylinder_position_area_min"]
 CYLINDER_POSITION_AREA_MAX = OBJECT_CONFIG["cylinder_position_area_max"]
+MIN_INITIAL_CLEARANCE = OBJECT_CONFIG.get("min_initial_clearance", 0.003)
+POSE_RESAMPLE_ATTEMPTS = OBJECT_CONFIG.get("pose_resample_attempts", 100)
 
 L_YAW_RANGE = OBJECT_CONFIG["l_yaw_range"]
 CYLINDER_YAW_RANGE = OBJECT_CONFIG["cylinder_yaw_range"]
@@ -233,6 +235,65 @@ def sample_yaw_orientations(rng, count, yaw_range):
     return orientations, yaws
 
 
+def distance_to_axis_aligned_rect(point_xy, rect_min, rect_max):
+    clamped = np.minimum(np.maximum(point_xy, rect_min), rect_max)
+    return float(np.linalg.norm(point_xy - clamped))
+
+
+def l_object_cylinder_clearance(l_xy, l_yaw, cylinder_xy):
+    c, s = np.cos(-l_yaw), np.sin(-l_yaw)
+    rot_world_to_l = np.array([[c, -s], [s, c]], dtype=np.float32)
+    cylinder_l_xy = rot_world_to_l @ (cylinder_xy - l_xy)
+
+    vertical_min = np.array([0.0, 0.0], dtype=np.float32)
+    vertical_max = np.array([L_THICKNESS, L_ARM_LENGTH], dtype=np.float32)
+    horizontal_min = np.array([0.0, 0.0], dtype=np.float32)
+    horizontal_max = np.array([L_ARM_LENGTH, L_THICKNESS], dtype=np.float32)
+
+    dist = min(
+        distance_to_axis_aligned_rect(cylinder_l_xy, vertical_min, vertical_max),
+        distance_to_axis_aligned_rect(cylinder_l_xy, horizontal_min, horizontal_max),
+    )
+    return dist - CYLINDER_RADIUS
+
+
+def sample_nonoverlapping_object_pose_pair(rng):
+    best_sample = None
+    best_clearance = -float("inf")
+    for _ in range(POSE_RESAMPLE_ATTEMPTS):
+        l_local_position = sample_planar_positions(
+            rng, 1, L_POSITION_AREA_MIN, L_POSITION_AREA_MAX, z_height=0.0
+        )[0]
+        cylinder_local_position = sample_planar_positions(
+            rng, 1, CYLINDER_POSITION_AREA_MIN, CYLINDER_POSITION_AREA_MAX,
+            z_height=OBJECT_HEIGHT * 0.5,
+        )[0]
+        l_orientation, l_yaw = sample_yaw_orientations(rng, 1, L_YAW_RANGE)
+        cylinder_orientation, cylinder_yaw = sample_yaw_orientations(
+            rng, 1, CYLINDER_YAW_RANGE
+        )
+        clearance = l_object_cylinder_clearance(
+            l_local_position[:2],
+            float(l_yaw[0]),
+            cylinder_local_position[:2],
+        )
+        sample = (
+            l_local_position,
+            cylinder_local_position,
+            l_orientation[0],
+            cylinder_orientation[0],
+            l_yaw[0],
+            cylinder_yaw[0],
+        )
+        if clearance > best_clearance:
+            best_sample = sample
+            best_clearance = clearance
+        if clearance >= MIN_INITIAL_CLEARANCE:
+            return sample
+
+    return best_sample
+
+
 def randomize_object_poses(env_roots, l_objects, cylinder_objects, seed=None):
     rng = np.random.default_rng(seed)
 
@@ -240,23 +301,13 @@ def randomize_object_poses(env_roots, l_objects, cylinder_objects, seed=None):
     env_positions = as_numpy(env_positions)
     num_envs = len(env_positions)
 
-    l_local_positions = sample_planar_positions(
-        rng,
-        num_envs,
-        L_POSITION_AREA_MIN,
-        L_POSITION_AREA_MAX,
-        z_height=0.0,
-    )
-    cylinder_local_positions = sample_planar_positions(
-        rng,
-        num_envs,
-        CYLINDER_POSITION_AREA_MIN,
-        CYLINDER_POSITION_AREA_MAX,
-        z_height=OBJECT_HEIGHT * 0.5,
-    )
-
-    l_orientations, l_yaws = sample_yaw_orientations(rng, num_envs, L_YAW_RANGE)
-    cylinder_orientations, cylinder_yaws = sample_yaw_orientations(rng, num_envs, CYLINDER_YAW_RANGE)
+    samples = [sample_nonoverlapping_object_pose_pair(rng) for _ in range(num_envs)]
+    l_local_positions = np.stack([s[0] for s in samples], axis=0)
+    cylinder_local_positions = np.stack([s[1] for s in samples], axis=0)
+    l_orientations = np.stack([s[2] for s in samples], axis=0)
+    cylinder_orientations = np.stack([s[3] for s in samples], axis=0)
+    l_yaws = np.asarray([s[4] for s in samples], dtype=np.float32)
+    cylinder_yaws = np.asarray([s[5] for s in samples], dtype=np.float32)
 
     l_world_positions = env_positions + l_local_positions
     cylinder_world_positions = env_positions + cylinder_local_positions
@@ -480,3 +531,4 @@ if __name__ == "__main__":
 #!     ├── env_1/FingerRobot  ← articulation instance 1
 #!     ├── env_2/FingerRobot  ← articulation instance 2
 #! ---------------------------------------------------------------------------
+

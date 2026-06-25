@@ -5,8 +5,8 @@ scene:
   cylinder_radius: 0.05
   l_collision_approximation: convexHull
   cylinder_collision_approximation: convexHull
-  num_envs: 12
-  env_spacing: 1.2
+  num_envs: 64
+  env_spacing: 1.8
   envs_root_path: /World/envs
   source_env_name: env_0
   l_object_local_position: [-0.10, -0.06, 0.0]
@@ -26,6 +26,8 @@ objects:
   l_position_area_max: [0.25, 0.25]
   cylinder_position_area_min: [-0.25, -0.25]
   cylinder_position_area_max: [0.25, 0.25]
+  min_initial_clearance: 0.003
+  pose_resample_attempts: 100
   l_yaw_range: [-3.141592653589793, 3.141592653589793]
   cylinder_yaw_range: [-3.141592653589793, 3.141592653589793]
 
@@ -34,7 +36,7 @@ finger:
   standalone_root_path: /World/FingerRobot
   sphere_radius: 0.0125
   box_half: 0.008
-  limit_lower: [-0.25, -0.25, 0.05]
+  limit_lower: [-0.25, -0.25, 0.025]
   limit_upper: [0.25, 0.25, 0.25]
   drive_stiffness: 200.0
   drive_damping: 40.0
@@ -43,7 +45,7 @@ finger:
   drive_stiffness_range: [120.0, 320.0]
   drive_damping_range: [24.0, 64.0]
   fingertip_mass_range: [1.5, 3.0]
-  default_xyz: [0.0, 0.0, 0.2]
+  default_xyz: [0.0, 0.0, 0.025]
 
 striker:
   local_path: Striker

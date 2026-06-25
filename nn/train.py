@@ -29,7 +29,22 @@ import torch
 import torch.nn.functional as F
 
 #* -- project paths --------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def find_project_root() -> Path:
+    candidates = [
+        Path(__file__).resolve().parents[1],
+        Path.cwd(),
+        Path("/home/xiao/0_codes/poke_map"),
+    ]
+    for candidate in candidates:
+        if ((candidate / "config.yaml").exists() and
+            (candidate / "nn").exists() and
+            (candidate / "vision").exists() and
+            (candidate / "env").exists()):
+            return candidate
+    raise RuntimeError("Could not find poke_map project root.")
+
+
+PROJECT_ROOT = find_project_root()
 for p in (PROJECT_ROOT, PROJECT_ROOT / "nn", PROJECT_ROOT / "env",
           PROJECT_ROOT / "vision"):
     if p.exists() and str(p) not in sys.path:
@@ -39,9 +54,14 @@ for p in (PROJECT_ROOT, PROJECT_ROOT / "nn", PROJECT_ROOT / "env",
 try:
     from isaacsim.core.experimental.prims import Articulation, RigidPrim, XformPrim
     import isaacsim.core.experimental.utils.app as app_utils
+    import isaacsim.core.experimental.utils.stage as stage_utils
     from omni.kit.async_engine import run_coroutine
+    from pxr import Gf, UsdGeom
     _HAS_ISAAC = True
 except ModuleNotFoundError:
+    Gf = None
+    UsdGeom = None
+    stage_utils = None
     _HAS_ISAAC = False
 
 #* -- project modules ------------------------------------------------------
@@ -62,6 +82,9 @@ SCENE_CONFIG = CONFIG["scene"]
 FINGER_CONFIG = CONFIG["finger"]
 
 OBJECT_HEIGHT = SCENE_CONFIG["object_height"]
+L_ARM_LENGTH = SCENE_CONFIG["l_arm_length"]
+L_THICKNESS = SCENE_CONFIG["l_thickness"]
+CYLINDER_RADIUS = SCENE_CONFIG["cylinder_radius"]
 ENVS_ROOT_PATH = SCENE_CONFIG["envs_root_path"]
 FINGER_LOCAL_PATH = FINGER_CONFIG["local_root_path"]
 FINGER_ROOT_PATTERN = f"{ENVS_ROOT_PATH}/env_.*/{FINGER_LOCAL_PATH}"
@@ -75,11 +98,11 @@ NUM_ENVS = SCENE_CONFIG["num_envs"]
 
 GAMMA: float = 0.95
 LR: float = 3e-4
-BATCH_SIZE: int = 64
-BUFFER_CAPACITY: int = 25_000
+BATCH_SIZE: int = 128
+BUFFER_CAPACITY: int = 100_000
 EPS_START: float = 1.0
 EPS_END: float = 0.05
-EPS_DECAY: int = 2_000           # episodes over which ε decays
+EPS_DECAY: int = 250             # episodes over which ε decays
 SIGMA_START: float = 0.3
 SIGMA_END: float = 0.05
 TAU: float = 0.005               # polyak averaging coefficient
@@ -89,22 +112,35 @@ C_SUCCESS: float = 10.0          # terminal success bonus
 SUCCESS_THRESHOLD: float = 0.02  # metres — tolerance to target
 DELTA_D_MAX: float = 0.2          # max standoff (m)
 IMPACT_STEPS: int = 40            # physics steps per strike (k_p=200, m≈2 kg)
-OVERTRAVEL: float = 0.05          # finger pushes this far past contact (m)
-SAFE_Z: float = FINGER_CONFIG["default_xyz"][2]  # safe height (m)
+FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
+STANDOFF_CLEARANCE: float = 0.01  # gap between fingertip sphere and object
+OVERTRAVEL: float = 0.005         # extra sphere penetration past first contact
+POKE_Z: float = OBJECT_HEIGHT * 0.5  # side-poke height at object midline
+SAFE_Z: float = POKE_Z
 
-# yaw curriculum — translation-first, orientation added gradually
-C_YAW: float = 0.5                     # weight on orientation progress reward
-YAW_THRESHOLD: float = np.deg2rad(10)  # radians — tolerance for success
-YAW_CURRICULUM_START: int = 0          # episode to begin expanding yaw range
-YAW_CURRICULUM_END: int = 500          # episode to reach full yaw range
-YAW_FULL_RANGE: float = np.pi          # radians — ±180° full orientation
+# yaw training controls
+# Stage A: keep target yaw equal to current yaw, softly discourage yaw drift,
+#          but let success depend on translation only.
+# Stage B: load weights-only, clear replay, set YAW_TARGET_MODE="curriculum"
+#          or "fixed", and enable yaw success.
+YAW_TARGET_MODE: str = "preserve"       # "preserve", "curriculum", or "fixed"
+C_YAW: float = 0.1                      # weight on orientation progress reward
+YAW_REWARD_ENABLED: bool = True         # soft yaw preservation/control reward
+YAW_SUCCESS_ENABLED: bool = False       # include yaw threshold in done/success
+YAW_THRESHOLD: float = np.deg2rad(10)   # radians — tolerance for yaw success
+YAW_CURRICULUM_START: int = 0           # episode to begin expanding yaw range
+YAW_CURRICULUM_END: int = 500           # episode to reach full yaw range
+YAW_FULL_RANGE: float = np.pi           # radians — ±180° full orientation
 
-TRAIN_AFTER: int = 256           # start training after this many transitions
-TRAIN_EVERY: int = 4             # train every N env steps
+TRAIN_AFTER: int = 1_024         # start training after this many transitions
+TRAIN_EVERY: int = 1             # train every N env steps
+GRAD_UPDATES_PER_STEP: int = 4   # replay updates per env step
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 CHECKPOINT_EVERY: int = 100       # episodes between saves
 CHECKPOINT_KEEP: int = 3          # how many recent checkpoints to keep
+SHOW_TARGET_OVERLAY: bool = True  # draw per-env target poses in the USD scene
+TARGET_OVERLAY_Z_OFFSET: float = 0.003
 
 
 #* ================================================================
@@ -231,6 +267,93 @@ def sample_target_poses(
             "Cylinder": np.stack([cx, cy, z], axis=-1)}
 
 
+def _ensure_xform(stage, path: str):
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        UsdGeom.Xform.Define(stage, path)
+    return stage.GetPrimAtPath(path)
+
+
+def _set_local_transform(path: str, translation, yaw: float = 0.0, scale=None):
+    stage = stage_utils.get_current_stage(backend="usd")
+    prim = _ensure_xform(stage, path)
+    xform = UsdGeom.Xformable(prim)
+    transform_attr = prim.GetAttribute("xformOp:transform")
+    if transform_attr and transform_attr.IsValid():
+        xform_op = UsdGeom.XformOp(transform_attr)
+    else:
+        xform_op = xform.AddTransformOp()
+    xform.SetXformOpOrder([xform_op])
+
+    mat = Gf.Matrix4d(1.0)
+    if scale is not None:
+        mat.SetScale(Gf.Vec3d(float(scale[0]), float(scale[1]), float(scale[2])))
+    rot = Gf.Matrix4d(Gf.Rotation(Gf.Vec3d(0, 0, 1), np.rad2deg(float(yaw))),
+                      Gf.Vec3d(0.0, 0.0, 0.0))
+    trans = Gf.Matrix4d(1.0)
+    trans.SetTranslate(Gf.Vec3d(float(translation[0]),
+                                float(translation[1]),
+                                float(translation[2])))
+    xform_op.Set(mat * rot * trans)
+
+
+def _set_display_color(prim, color_rgb):
+    gprim = UsdGeom.Gprim(prim)
+    attr = gprim.GetDisplayColorAttr()
+    if not attr.IsValid():
+        attr = gprim.CreateDisplayColorAttr()
+    attr.Set([Gf.Vec3f(float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))])
+
+
+def update_target_overlay(targets_pos: dict[str, np.ndarray],
+                          targets_ori: dict[str, np.ndarray]):
+    """Draw non-physics target overlays under each env root."""
+    if not SHOW_TARGET_OVERLAY or not _HAS_ISAAC:
+        return
+
+    stage = stage_utils.get_current_stage(backend="usd")
+    for env_idx in range(NUM_ENVS):
+        overlay_root = f"{ENVS_ROOT_PATH}/env_{env_idx}/TargetOverlay"
+        _ensure_xform(stage, overlay_root)
+
+        # L target: two green translucent-looking guide bars, parented under
+        # an oriented target xform matching the rendered goal contour.
+        l_path = f"{overlay_root}/LObjectTarget"
+        _ensure_xform(stage, l_path)
+        l_pos = targets_pos["LObject"][env_idx].copy()
+        l_pos[2] = TARGET_OVERLAY_Z_OFFSET
+        l_quat = targets_ori["LObject"][env_idx]
+        l_yaw = 2.0 * np.arctan2(l_quat[3], l_quat[0])
+        _set_local_transform(l_path, l_pos, yaw=l_yaw)
+
+        l_parts = {
+            "VerticalLeg": (
+                [L_THICKNESS * 0.5, L_ARM_LENGTH * 0.5, OBJECT_HEIGHT * 0.5],
+                [L_THICKNESS, L_ARM_LENGTH, OBJECT_HEIGHT],
+            ),
+            "HorizontalLeg": (
+                [L_ARM_LENGTH * 0.5, L_THICKNESS * 0.5, OBJECT_HEIGHT * 0.5],
+                [L_ARM_LENGTH, L_THICKNESS, OBJECT_HEIGHT],
+            ),
+        }
+        for part_name, (center, scale) in l_parts.items():
+            part_path = f"{l_path}/{part_name}"
+            cube = UsdGeom.Cube.Define(stage, part_path)
+            cube.CreateSizeAttr(1.0)
+            _set_display_color(cube.GetPrim(), (0.0, 1.0, 0.15))
+            _set_local_transform(part_path, center, scale=scale)
+
+        # Cylinder target: yellow guide disk at target center.
+        cyl_path = f"{overlay_root}/CylinderTarget"
+        cyl = UsdGeom.Cylinder.Define(stage, cyl_path)
+        cyl.CreateRadiusAttr(CYLINDER_RADIUS)
+        cyl.CreateHeightAttr(OBJECT_HEIGHT)
+        _set_display_color(cyl.GetPrim(), (1.0, 0.95, 0.0))
+        cyl_pos = targets_pos["Cylinder"][env_idx].copy()
+        cyl_pos[2] = OBJECT_HEIGHT * 0.5 + TARGET_OVERLAY_Z_OFFSET
+        _set_local_transform(cyl_path, cyl_pos)
+
+
 #* ================================================================
 #*  Action selection
 #* ================================================================
@@ -289,7 +412,7 @@ def select_action(
             p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
 
             d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
-            dd_noisy = p[2] + abs(np.random.randn().astype(np.float32)) * noise_std
+            dd_noisy = p[2] + abs(np.float32(np.random.randn())) * noise_std
 
             # clamp & normalise direction
             norm = np.linalg.norm(d_noisy) + 1e-8
@@ -321,6 +444,23 @@ def _yaws_to_quats(yaws: np.ndarray) -> np.ndarray:
     return out
 
 
+def yaw_target_half_range(episode: int) -> float:
+    """Return the sampled target-yaw half range for this episode."""
+    if YAW_TARGET_MODE == "preserve":
+        return 0.0
+    if YAW_TARGET_MODE == "fixed":
+        return YAW_FULL_RANGE
+    if YAW_TARGET_MODE == "curriculum":
+        frac = np.clip((episode - YAW_CURRICULUM_START) /
+                       max(1, YAW_CURRICULUM_END - YAW_CURRICULUM_START),
+                       0.0, 1.0)
+        return float(frac * YAW_FULL_RANGE)
+    raise ValueError(
+        f"Unknown YAW_TARGET_MODE={YAW_TARGET_MODE!r}; "
+        "use 'preserve', 'curriculum', or 'fixed'."
+    )
+
+
 def compute_rewards(
     poses_before: dict,         # obj_name → (positions, quaternions) in world coords
     poses_after: dict,
@@ -328,6 +468,8 @@ def compute_rewards(
     env_root_pos: np.ndarray | None = None,  # (N_envs, 3)
     done_once: np.ndarray | None = None,     # (N_envs,) bool
     target_oris: dict | None = None,         # obj_name → (N_envs, 4) quat targets
+    yaw_reward_enabled: bool = YAW_REWARD_ENABLED,
+    yaw_success_enabled: bool = YAW_SUCCESS_ENABLED,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-env reward + done flag.
 
@@ -355,8 +497,10 @@ def compute_rewards(
         if obj_name == "LObject" and target_oris is not None and obj_name in target_oris:
             y_err_before = _yaw_error(poses_before[obj_name][1], target_oris[obj_name])
             y_err_after  = _yaw_error(poses_after[obj_name][1], target_oris[obj_name])
-            r += C_YAW * (y_err_before - y_err_after)
-            done &= (y_err_after < YAW_THRESHOLD)
+            if yaw_reward_enabled:
+                r += C_YAW * (y_err_before - y_err_after)
+            if yaw_success_enabled:
+                done &= (y_err_after < YAW_THRESHOLD)
 
     r -= C_STEP
 
@@ -382,11 +526,11 @@ async def env_step_async(
     """Execute strikes with the prismatic XYZ finger robot.
 
     Phases:
-      0. lift to safe height above current XY
-      1. move to standoff_xy at safe height (collision-free)
-      2. descend to standoff_xy at object height
+      0. move to side-poke height
+      1. move to standoff_xy at side-poke height
+      2. settle briefly at standoff
       3. strike — push OVERTRAVEL past contact
-      4. retract to safe height
+      4. retract back to standoff_xy at side-poke height
       5. settle objects
 
     Inactive envs (where active=False) are frozen at their current position
@@ -411,8 +555,13 @@ async def env_step_async(
     xy_high = np.array(LIMIT_UPPER[:2], dtype=np.float32)
 
     #* ── standoff from Δd ────────────────────────────────────────────
-    delta_d_clipped = np.clip(delta_d, 0.001, DELTA_D_MAX)
+    #* world_xy is a contour point. The controlled point is the sphere centre,
+    #* so keep at least one fingertip radius plus clearance outside the object.
+    min_standoff = FINGERTIP_RADIUS + STANDOFF_CLEARANCE
+    delta_d_clipped = np.clip(delta_d, min_standoff, DELTA_D_MAX)
     standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up
+    contact_xy = world_xy - dirs * FINGERTIP_RADIUS
+    strike_xy = contact_xy + dirs * OVERTRAVEL
 
     #* ── snap initial positions (inactive envs hold these throughout) ──
     q_cur = as_numpy(fingers.get_dof_positions()).copy()     # (B, 3)
@@ -421,25 +570,25 @@ async def env_step_async(
         if active is not None:
             targets[~active] = q_cur[~active]
 
-    #* ── Phase 0: lift to safe height above current position ─────────
+    #* ── Phase 0: move to side-poke height above current XY ──────────
     q0 = q_cur.copy()
-    q0[:, 2] = SAFE_Z
+    q0[:, 2] = POKE_Z
     _hold_inactive(q0)
     fingers.set_dof_position_targets(positions=q0.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
     await _step_physics(25)
 
-    #* ── Phase 1: move to standoff at safe height (above objects) ───
+    #* ── Phase 1: move to standoff at side-poke height ──────────────
     q1 = np.zeros((B, 3), dtype=np.float32)
     q1[:, :2] = np.clip(standoff_xy, xy_low, xy_high)
-    q1[:, 2] = SAFE_Z
+    q1[:, 2] = POKE_Z
     _hold_inactive(q1)
     fingers.set_dof_position_targets(positions=q1.tolist(), dof_indices=dof_indices)
     await _step_physics(40)
 
-    #* ── Phase 2: descend to standoff at object height ───────────────
+    #* ── Phase 2: hold standoff before impact ───────────────────────
     q2 = q1.copy()
-    q2[:, 2] = OBJECT_HEIGHT
+    q2[:, 2] = POKE_Z
     _hold_inactive(q2)
     fingers.set_dof_position_targets(positions=q2.tolist(), dof_indices=dof_indices)
     await _step_physics(20)
@@ -449,35 +598,32 @@ async def env_step_async(
     #* pushing force kp*OVERTRAVEL.  No velocity target avoids oscillation
     #* at the contact point (velocity tracking fights the constraint).
     q3 = np.zeros((B, 3), dtype=np.float32)
-    q3[:, :2] = np.clip(world_xy + dirs * OVERTRAVEL, xy_low, xy_high)
-    q3[:, 2] = OBJECT_HEIGHT
+    q3[:, :2] = np.clip(strike_xy, xy_low, xy_high)
+    q3[:, 2] = POKE_Z
     _hold_inactive(q3)
 
     fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
     await _step_physics(IMPACT_STEPS)
 
-    #* ── Phase 4: retract to safe height ─────────────────────────────
-    q4 = q3.copy()
-    q4[:, 2] = SAFE_Z
+    #* ── Phase 4: retract back to standoff at side-poke height ───────
+    q4 = q2.copy()
+    q4[:, 2] = POKE_Z
     _hold_inactive(q4)
     fingers.set_dof_position_targets(positions=q4.tolist(), dof_indices=dof_indices)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
     await _step_physics(20)
 
-    #* ── Phase 5: settle objects — wait until all stopped ────────────
-    VEL_THRESH = 0.005
-    MAX_SETTLE = 100
+    #* ── Phase 5: settle briefly, then clear residual object velocities ─
+    SETTLE_STEPS = 30
     l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
     cyl_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
 
-    for _ in range(MAX_SETTLE):
-        await _step_physics(1)
-        lv = as_numpy(l_objects.get_linear_velocities())
-        cv = as_numpy(cyl_objects.get_linear_velocities())
-        if (bool(np.all(np.linalg.norm(lv, axis=1) < VEL_THRESH)) and
-            bool(np.all(np.linalg.norm(cv, axis=1) < VEL_THRESH))):
-            break
+    await _step_physics(SETTLE_STEPS)
+    zero_vel = np.zeros((B, 3), dtype=np.float32)
+    l_objects.set_velocities(linear_velocities=zero_vel, angular_velocities=zero_vel)
+    cyl_objects.set_velocities(linear_velocities=zero_vel, angular_velocities=zero_vel)
+    await _step_physics(1)
 
     #* ── query new object poses ─────────────────────────────────────
     poses, env_root_pos = get_object_poses_vectorized()
@@ -667,7 +813,7 @@ class Trainer:
 
         #* ── reposition finger at object level (centre of each env) ──
         dof_idx = self.fingers.get_dof_indices(self.fingers.dof_names)
-        init_pos = np.tile([0.0, 0.0, SAFE_Z], (NUM_ENVS, 1)).astype(np.float32)
+        init_pos = np.tile([0.0, 0.0, POKE_Z], (NUM_ENVS, 1)).astype(np.float32)
         init_vel = np.zeros((NUM_ENVS, 3), dtype=np.float32)
         self.fingers.set_dof_position_targets(positions=init_pos.tolist(), dof_indices=dof_idx)
         self.fingers.set_dof_velocity_targets(velocities=init_vel.tolist(), dof_indices=dof_idx)
@@ -686,13 +832,11 @@ class Trainer:
         l_quats = poses_before["LObject"][1]
         l_yaws = 2.0 * np.arctan2(l_quats[:, 3], l_quats[:, 0])
 
-        # yaw curriculum: linear ramp from 0 to full range
-        frac = np.clip((episode - YAW_CURRICULUM_START) /
-                       max(1, YAW_CURRICULUM_END - YAW_CURRICULUM_START), 0.0, 1.0)
-        yaw_half_range = frac * YAW_FULL_RANGE
+        yaw_half_range = yaw_target_half_range(episode)
         l_target_yaws = l_yaws + self.rng.uniform(-yaw_half_range, yaw_half_range,
                                                    size=NUM_ENVS)
         targets_ori["LObject"] = _yaws_to_quats(l_target_yaws.astype(np.float32))
+        update_target_overlay(targets_pos, targets_ori)
 
         # vision
         x, seg_maps = build_vision_observation(
@@ -714,10 +858,14 @@ class Trainer:
 
         ep_return = 0.0
         ep_len = 0
+        active_counts = []
+        ep_active_steps = 0
 
         for step in range(MAX_STEPS):
             has_contour = contour_masks.any(dim=(-2, -1)).cpu().numpy()
             was_active = ~self._done_once & has_contour  # done OR invisible → frozen
+            active_counts.append(int(was_active.sum()))
+            ep_active_steps += int(was_active.sum())
 
             #* — select actions ——————————————————————————————
             pixel_ij, d_xy, delta_d = select_action(
@@ -733,7 +881,9 @@ class Trainer:
             rewards, dones, self._done_once = compute_rewards(
                 poses_before, poses_after,
                 self._targets_pos, self._env_root_pos, self._done_once,
-                target_oris=self._targets_ori)
+                target_oris=self._targets_ori,
+                yaw_reward_enabled=YAW_REWARD_ENABLED,
+                yaw_success_enabled=YAW_SUCCESS_ENABLED)
             rewards[~was_active] = 0.0
 
             #* — observe next state ——————————————————————————
@@ -764,38 +914,49 @@ class Trainer:
 
             #* — training —————————————————————————————————————
             if self.buffer.size >= TRAIN_AFTER and self.global_step % TRAIN_EVERY == 0:
-                batch = self.buffer.sample(BATCH_SIZE)
-                lq, lmu = train_step(
-                    self.actor_critic, self.target_net,
-                    self.optimizer_q, self.optimizer_mu,
-                    batch,
-                )
-                soft_update(self.target_net, self.actor_critic, TAU)
+                for _ in range(GRAD_UPDATES_PER_STEP):
+                    batch = self.buffer.sample(BATCH_SIZE)
+                    lq, lmu = train_step(
+                        self.actor_critic, self.target_net,
+                        self.optimizer_q, self.optimizer_mu,
+                        batch,
+                    )
+                    soft_update(self.target_net, self.actor_critic, TAU)
 
             if self._done_once.all():
                 break
 
         self.ep_returns.append(ep_return)
         self.ep_lengths.append(ep_len)
+        self._last_active_counts = active_counts
+        self._last_ep_active_steps = ep_active_steps
 
         return ep_return, ep_len
 
     def log(self, episode: int, ep_return: float, ep_len: int, elapsed: float):
         avg_r = np.mean(self.ep_returns) if self.ep_returns else 0.0
         avg_l = np.mean(self.ep_lengths) if self.ep_lengths else 0.0
+        active_counts = getattr(self, "_last_active_counts", [])
+        active_steps = getattr(self, "_last_ep_active_steps", 0)
+        r_per_active = ep_return / max(1, active_steps)
+        active_summary = ""
+        if active_counts:
+            active_summary = f"  active={active_counts[0]}→{active_counts[-1]}"
         print(
             f"[ep {episode:5d}] "
             f"return={ep_return:7.2f}  len={ep_len:3d}  "
             f"avg100_r={avg_r:7.2f}  avg100_len={avg_l:5.1f}  "
+            f"r/active={r_per_active:7.4f}  "
             f"ε={self.epsilon:.3f}  σ={self.noise_std:.3f}  "
             f"buf={self.buffer.size:6d}  dt={elapsed:.1f}s"
+            f"{active_summary}"
         )
 
     def save_checkpoint(self, path: str | Path, episode: int):
         """Save full training state to disk."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        ckpt = {
             "actor_critic": self.actor_critic.state_dict(),
             "target_net":   self.target_net.state_dict(),
             "optimizer_q":  self.optimizer_q.state_dict(),
@@ -805,18 +966,23 @@ class Trainer:
             "noise_std":    self.noise_std,
             "episode":      episode,
             "rng_state":    self.rng.bit_generator.state,
+            "np_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
             "ep_returns":   list(self.ep_returns),
             "ep_lengths":   list(self.ep_lengths),
-            "buffer_x":       self.buffer.x[:self.buffer.size].clone(),
-            "buffer_x_next":  self.buffer.x_next[:self.buffer.size].clone(),
-            "buffer_pixel":   self.buffer.pixel[:self.buffer.size].clone(),
-            "buffer_d_xy":    self.buffer.d_xy[:self.buffer.size].clone(),
-            "buffer_delta_d": self.buffer.delta_d[:self.buffer.size].clone(),
-            "buffer_r":       self.buffer.r[:self.buffer.size].clone(),
-            "buffer_done":    self.buffer.done[:self.buffer.size].clone(),
+            "buffer_x":       self.buffer.x[:self.buffer.size],
+            "buffer_x_next":  self.buffer.x_next[:self.buffer.size],
+            "buffer_pixel":   self.buffer.pixel[:self.buffer.size],
+            "buffer_d_xy":    self.buffer.d_xy[:self.buffer.size],
+            "buffer_delta_d": self.buffer.delta_d[:self.buffer.size],
+            "buffer_r":       self.buffer.r[:self.buffer.size],
+            "buffer_done":    self.buffer.done[:self.buffer.size],
             "buffer_ptr":     self.buffer.ptr,
             "buffer_size":    self.buffer.size,
-        }, path)
+        }
+        if DEVICE == "cuda":
+            ckpt["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+        torch.save(ckpt, path)
         print(f"[checkpoint] saved ep {episode} to {path} "
               f"(buf={self.buffer.size})")
 
@@ -831,6 +997,12 @@ class Trainer:
         self.epsilon     = ckpt["epsilon"]
         self.noise_std   = ckpt["noise_std"]
         self.rng.bit_generator.state = ckpt["rng_state"]
+        if "np_rng_state" in ckpt:
+            np.random.set_state(ckpt["np_rng_state"])
+        if "torch_rng_state" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng_state"])
+        if "cuda_rng_state" in ckpt and DEVICE == "cuda":
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
         self.ep_returns = deque(ckpt["ep_returns"], maxlen=100)
         self.ep_lengths = deque(ckpt["ep_lengths"], maxlen=100)
 
@@ -850,19 +1022,54 @@ class Trainer:
               f"(buf={s}, step={self.global_step})")
         return ckpt["episode"]
 
-async def main_async(num_episodes: int = 10_000, resume: str | None = None):
+    def load_checkpoint_weights_only(
+        self,
+        path: str | Path,
+        load_optimizers: bool = True,
+    ) -> int:
+        """Load model weights for a new stage without restoring replay."""
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+        self.actor_critic.load_state_dict(ckpt["actor_critic"])
+        self.target_net.load_state_dict(ckpt["target_net"])
+        if load_optimizers:
+            self.optimizer_q.load_state_dict(ckpt["optimizer_q"])
+            self.optimizer_mu.load_state_dict(ckpt["optimizer_mu"])
+        self.buffer = ReplayBuffer()
+        self.global_step = 0
+        self.epsilon = EPS_START
+        self.noise_std = SIGMA_START
+        self.ep_returns.clear()
+        self.ep_lengths.clear()
+        print(f"[checkpoint] loaded weights from ep {ckpt['episode']} at {path} "
+              f"(cleared replay buffer)")
+        return ckpt["episode"]
+
+
+async def main_async(
+    num_episodes: int = 10_000,
+    resume: str | None = None,
+    resume_mode: str = "full",
+):
     trainer = Trainer()
     start_ep = 1
     if resume:
         await trainer.setup()
-        start_ep = trainer.load_checkpoint(resume) + 1
+        if resume_mode == "full":
+            start_ep = trainer.load_checkpoint(resume) + 1
+        elif resume_mode == "weights":
+            trainer.load_checkpoint_weights_only(resume)
+            start_ep = 1
+        else:
+            raise ValueError("resume_mode must be 'full' or 'weights'")
     else:
         await trainer.setup()
 
     print(f"[train] device={DEVICE}  envs={NUM_ENVS}  buffer={BUFFER_CAPACITY}")
     print(f"[train] max_steps/ep={MAX_STEPS}  gamma={GAMMA}  lr={LR}")
+    print(f"[train] yaw_mode={YAW_TARGET_MODE}  yaw_reward={YAW_REWARD_ENABLED}  "
+          f"yaw_success={YAW_SUCCESS_ENABLED}  c_yaw={C_YAW}")
     if resume:
-        print(f"[train] resuming from episode {start_ep}")
+        print(f"[train] resume_mode={resume_mode}  starting episode {start_ep}")
 
     for ep in range(start_ep, num_episodes + 1):
         t0 = time.time()
@@ -880,8 +1087,12 @@ async def main_async(num_episodes: int = 10_000, resume: str | None = None):
     return trainer
 
 
-def main(num_episodes: int = 10_000, resume: str | None = None):
-    return run_coroutine(main_async(num_episodes, resume))
+def main(
+    num_episodes: int = 10_000,
+    resume: str | None = None,
+    resume_mode: str = "full",
+):
+    return run_coroutine(main_async(num_episodes, resume, resume_mode))
 
 
 if __name__ == "__main__":
