@@ -17,10 +17,10 @@ scene:
   settle_steps: 10
 
 workspace:
-  x_min: -0.25
-  x_max: 0.25
-  y_min: -0.25
-  y_max: 0.25
+  x_min: -0.4
+  x_max: 0.4
+  y_min: -0.4
+  y_max: 0.4
 
 objects:
   l_position_area_min: [-0.25, -0.25]
@@ -37,8 +37,8 @@ finger:
   standalone_root_path: /World/FingerRobot
   sphere_radius: 0.0125
   box_half: 0.008
-  limit_lower: [-0.25, -0.25, 0.025]
-  limit_upper: [0.25, 0.25, 0.25]
+  limit_lower: [-0.4, -0.4, 0.025]
+  limit_upper: [0.4, 0.4, 0.25]
   drive_stiffness: 1500.0
   drive_damping: 180.0
   drive_max_force: 500.0

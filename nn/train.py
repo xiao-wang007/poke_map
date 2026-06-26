@@ -114,14 +114,14 @@ TAU: float = 0.005               # polyak averaging coefficient
 MAX_STEPS: int = 30              # max pokes per episode
 C_STEP: float = 0.01             # per-step penalty
 C_SUCCESS: float = 10.0          # terminal success bonus
+C_OOB: float = -5.0              # out-of-workspace penalty
 SUCCESS_THRESHOLD: float = 0.02  # metres — tolerance to target
 STOP_POKE_THRESHOLD: float = 0.035  # metres — stop touching near-target envs
 DELTA_D_MAX: float = 0.2          # max standoff (m)
 IMPACT_STEPS: int = 80            # physics steps holding the strike command
 FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
 STANDOFF_CLEARANCE: float = 0.01  # gap between fingertip sphere and object
-OVERTRAVEL: float = 0.1          # extra sphere penetration past first contact
-STRIKE_SPEED: float = 0.15        # m/s velocity target during impact
+OVERTRAVEL: float = 0.05          # DEPRECATED — delta_d now controls penetration symmetrically
 POKE_Z: float = OBJECT_HEIGHT * 0.5  # side-poke height at object midline
 SAFE_Z: float = POKE_Z
 FINGER_TRACK_TOL: float = 0.003   # metres — phase target convergence tolerance
@@ -521,15 +521,15 @@ def update_action_overlay(pixel_ij: np.ndarray,
             stage.RemovePrim(f"{overlay_root}/Strike")
 
         world = pixel_to_world(tuple(pixel_ij[env_idx]), K)
-        contact_xy = world[:2]
-        standoff_xy = contact_xy - dirs[env_idx] * delta_d_clipped[env_idx]
-        sphere_contact_xy = contact_xy - dirs[env_idx] * FINGERTIP_RADIUS
-        strike_xy = sphere_contact_xy + dirs[env_idx] * OVERTRAVEL
+        world_xy = world[:2]
+        standoff_xy = world_xy - dirs[env_idx] * delta_d_clipped[env_idx]
+        contact_xy = world_xy - dirs[env_idx] * FINGERTIP_RADIUS   # sphere touches surface
+        strike_xy = world_xy + dirs[env_idx] * delta_d_clipped[env_idx]  # symmetric
 
         points = {
             "Standoff": (standoff_xy, (0.0, 0.25, 1.0)),
-            "Contact": (contact_xy, (1.0, 0.0, 0.0)),
-            "Overtravel": (strike_xy, (1.0, 1.0, 1.0)),
+            "Contact": (world_xy, (1.0, 0.0, 0.0)),
+            "Strike": (strike_xy, (1.0, 1.0, 1.0)),
         }
         for name, (xy, color) in points.items():
             path = f"{overlay_root}/{name}"
@@ -820,11 +820,35 @@ def compute_rewards(
 
     r -= C_STEP
 
+    # OOB termination: if any object leaves the workspace, terminate with penalty
+    oob_after = ~objects_in_workspace(poses_after, env_root_pos)
+    r[oob_after] += C_OOB
+    done |= oob_after
+
     first_done = done & ~done_once
     r[first_done] += C_SUCCESS
     done_once = done_once | done
 
     return r, done, done_once
+
+
+def objects_in_workspace(
+    poses: dict,
+    env_root_pos: np.ndarray,
+    wx_min: float = float(WORKSPACE_CONFIG["x_min"]),
+    wx_max: float = float(WORKSPACE_CONFIG["x_max"]),
+    wy_min: float = float(WORKSPACE_CONFIG["y_min"]),
+    wy_max: float = float(WORKSPACE_CONFIG["y_max"]),
+) -> np.ndarray:
+    """Return bool array: True where ALL object CoMs are inside workspace."""
+    num_envs = list(poses.values())[0][0].shape[0]
+    inside = np.ones(num_envs, dtype=bool)
+    offset = env_root_pos[:, :2]
+    for obj_name, (positions, _) in poses.items():
+        local_xy = positions[:, :2].copy() - offset
+        inside &= (local_xy[:, 0] >= wx_min) & (local_xy[:, 0] <= wx_max)
+        inside &= (local_xy[:, 1] >= wy_min) & (local_xy[:, 1] <= wy_max)
+    return inside
 
 
 def near_translation_targets(
@@ -862,7 +886,7 @@ async def env_step_async(
       0. move to side-poke height
       1. move to standoff_xy at side-poke height
       2. settle briefly at standoff
-      3. strike — push OVERTRAVEL past contact
+      3. strike — push Δd forward past the contour (world_xy is midpoint)
       4. retract back to standoff_xy at side-poke height
       5. settle objects
 
@@ -892,9 +916,8 @@ async def env_step_async(
     #* so keep at least one fingertip radius plus clearance outside the object.
     min_standoff = FINGERTIP_RADIUS + STANDOFF_CLEARANCE
     delta_d_clipped = np.clip(delta_d, min_standoff, DELTA_D_MAX)
-    standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up
-    contact_xy = world_xy - dirs * FINGERTIP_RADIUS
-    strike_xy = contact_xy + dirs * OVERTRAVEL
+    standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up (half Δd behind)
+    strike_xy = world_xy + dirs * delta_d_clipped[:, None]     # (B, 2) symmetric penetration forward
 
     #* ── snap initial positions (inactive envs hold these throughout) ──
     try:
@@ -909,7 +932,7 @@ async def env_step_async(
             targets[~active] = q_cur[~active]
 
     async def _drive_to(targets: np.ndarray, max_steps: int,
-                        tol: float = FINGER_TRACK_TOL):
+                         donasdatol: float = FINGER_TRACK_TOL):
         fingers.set_dof_position_targets(positions=targets.tolist(), dof_indices=dof_indices)
         fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
         if active is not None and not np.any(active):
@@ -952,23 +975,18 @@ async def env_step_async(
     _hold_inactive(q2)
     await _drive_to(q2, max_steps=30)
 
-    #* ── Phase 3: strike — push OVERTRAVEL past contact ──────────────
-    #* Position-only PD (v_target=0) — OVERTRAVEL creates a steady
-    #* pushing force kp*OVERTRAVEL.  No velocity target avoids oscillation
-    #* at the contact point (velocity tracking fights the constraint).
+    #* ── Phase 3: strike — symmetric push past contour ────────────
+    #* world_xy is the midpoint; the finger pushes Δd forward past it.
+    #* Position-only PD (v_target=0): OVERTRAVEL via Δd creates a steady
+    #* pushing force kp*Δd.  No velocity target avoids oscillation at contact.
     q3 = np.zeros((B, 3), dtype=np.float32)
     q3[:, :2] = np.clip(strike_xy, xy_low, xy_high)
     q3[:, 2] = POKE_Z
     _hold_inactive(q3)
 
-    strike_v = np.zeros((B, 3), dtype=np.float32)
-    strike_v[:, :2] = dirs * STRIKE_SPEED
-    if active is not None:
-        strike_v[~active] = 0.0
     fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=strike_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(IMPACT_STEPS)
     fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
+    await _step_physics(IMPACT_STEPS)
 
     #* ── Phase 4: retract back to standoff at side-poke height ───────
     q4 = q2.copy()
@@ -1247,8 +1265,10 @@ class Trainer:
             near_target = near_translation_targets(
                 poses_before, self._targets_pos, self._env_root_pos
             )
+            oob_before = ~objects_in_workspace(poses_before, self._env_root_pos)
             self._done_once |= near_target
-            was_active = ~self._done_once & has_contour  # done OR invisible → frozen
+            self._done_once |= oob_before
+            was_active = ~self._done_once & has_contour  # done OR invisible OR oob → frozen
             active_counts.append(int(was_active.sum()))
             ep_active_steps += int(was_active.sum())
 
@@ -1281,6 +1301,7 @@ class Trainer:
             self._done_once |= near_translation_targets(
                 poses_after, self._targets_pos, self._env_root_pos
             )
+            self._done_once |= ~objects_in_workspace(poses_after, self._env_root_pos)
             rewards[~was_active] = 0.0
 
             #* — observe next state ——————————————————————————
