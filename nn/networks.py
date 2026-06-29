@@ -123,7 +123,7 @@ class SpatialActorCritic(nn.Module):
 
     Input  (B, 2, H, W) — contour_current + contour_goal
     Output q_map  (B, 1, H, W) — per-pixel Q-values (critic)
-           params (B, 3, H, W) — (d̑_x, d̑_y, Δd) per pixel, activated
+           params (B, 3, H, W) — (d̑_x, d̑_y, v) per pixel, activated
 
     Architecture
     ------------
@@ -150,7 +150,7 @@ class SpatialActorCritic(nn.Module):
         self,
         in_channels: int = 2,
         base_channels: int = 32,
-        delta_d_max: float = 0.15,
+        velocity_max: float = 0.4,
     ):
         super().__init__()
         c = base_channels
@@ -163,8 +163,8 @@ class SpatialActorCritic(nn.Module):
         self.film = FiLM(param_dim=3, feature_dim=c, hidden_dim=64)
 
         #! actor
-        self.param_head = nn.Conv2d(c, 3, 1)          # raw (d̑_x, d̑_y, Δd)
-        self.delta_d_max = delta_d_max
+        self.param_head = nn.Conv2d(c, 3, 1)          # raw (d̑_x, d̑_y, v)
+        self.velocity_max = velocity_max
 
     #* -- helpers -------------------------------------------------------
 
@@ -173,8 +173,8 @@ class SpatialActorCritic(nn.Module):
         """Apply tanh/sigmoid to raw param output; normalise direction."""
         d_xy  = torch.tanh(raw[:, :2])                    # (B, 2, H, W) in [-1, 1]
         d_xy  = F.normalize(d_xy, dim=1, eps=1e-6)       # unit length per pixel
-        delta = torch.sigmoid(raw[:, 2:]) * self.delta_d_max  # (B, 1, H, W)
-        return torch.cat([d_xy, delta], dim=1)          # (B, 3, H, W)
+        v = torch.sigmoid(raw[:, 2:]) * self.velocity_max  # (B, 1, H, W) m/s
+        return torch.cat([d_xy, v], dim=1)              # (B, 3, H, W)
 
     def params_at_pixel(
         self, params: torch.Tensor, pixel_ij: torch.Tensor

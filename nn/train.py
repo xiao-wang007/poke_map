@@ -79,12 +79,22 @@ from vision.camera import (
 )
 from nn.networks import SpatialActorCritic
 from env.make_finger_robot import LIMIT_LOWER, LIMIT_UPPER, configure_drives
-from env.scene_setup_articulated_vectorized import randomize_object_poses
+from env.scene_setup_articulated_vectorized import (
+    l_object_cylinder_clearance,
+    randomize_object_poses,
+)
+from env.quintic_poly import (
+    quintic_poly_query,
+    quintic_poly_derivative,
+    quintic_poly_second_derivative,
+    compute_strike_params,
+)
 
 CONFIG = load_config()
 SCENE_CONFIG = CONFIG["scene"]
 FINGER_CONFIG = CONFIG["finger"]
 WORKSPACE_CONFIG = CONFIG["workspace"]
+OBJECT_CONFIG = CONFIG["objects"]
 
 OBJECT_HEIGHT = SCENE_CONFIG["object_height"]
 L_ARM_LENGTH = SCENE_CONFIG["l_arm_length"]
@@ -95,67 +105,70 @@ FINGER_LOCAL_PATH = FINGER_CONFIG["local_root_path"]
 FINGER_ROOT_PATTERN = f"{ENVS_ROOT_PATH}/env_.*/{FINGER_LOCAL_PATH}"
 FINGER_TIP_PATTERN = f"{FINGER_ROOT_PATTERN}/z_link"
 NUM_ENVS = SCENE_CONFIG["num_envs"]
+TRAIN_CONFIG = CONFIG["training"]
 
 
 #* ================================================================
-#*  Hyper-parameters
+#*  Hyper-parameters  (sourced from config.yaml → training)
 #* ================================================================
 
-GAMMA: float = 0.95
-LR: float = 3e-4
-BATCH_SIZE: int = 128
-BUFFER_CAPACITY: int = 100_000
-EPS_START: float = 1.0
-EPS_END: float = 0.05
-EPS_DECAY: int = 250             # episodes over which ε decays
-SIGMA_START: float = 0.3
-SIGMA_END: float = 0.05
-TAU: float = 0.005               # polyak averaging coefficient
-MAX_STEPS: int = 30              # max pokes per episode
-C_STEP: float = 0.01             # per-step penalty
-C_SUCCESS: float = 10.0          # terminal success bonus
-C_OOB: float = -5.0              # out-of-workspace penalty
-SUCCESS_THRESHOLD: float = 0.02  # metres — tolerance to target
-STOP_POKE_THRESHOLD: float = 0.035  # metres — stop touching near-target envs
-DELTA_D_MAX: float = 0.2          # max standoff (m)
-IMPACT_STEPS: int = 80            # physics steps holding the strike command
+GAMMA: float = TRAIN_CONFIG["gamma"]
+LR: float = TRAIN_CONFIG["lr"]
+BATCH_SIZE: int = TRAIN_CONFIG["batch_size"]
+BUFFER_CAPACITY: int = TRAIN_CONFIG["buffer_capacity"]
+EPS_START: float = TRAIN_CONFIG["eps_start"]
+EPS_END: float = TRAIN_CONFIG["eps_end"]
+EPS_DECAY: int = TRAIN_CONFIG["eps_decay_episodes"]
+SIGMA_START: float = TRAIN_CONFIG["sigma_start"]
+SIGMA_END: float = TRAIN_CONFIG["sigma_end"]
+TAU: float = TRAIN_CONFIG["tau"]
+MAX_STEPS: int = TRAIN_CONFIG["max_steps_per_episode"]
+C_STEP: float = TRAIN_CONFIG["c_step"]
+C_SUCCESS: float = TRAIN_CONFIG["c_success"]
+C_OOB: float = TRAIN_CONFIG["c_oob"]
+SUCCESS_THRESHOLD: float = TRAIN_CONFIG["success_threshold"]
+STOP_POKE_THRESHOLD: float = TRAIN_CONFIG["stop_poke_threshold"]
+VELOCITY_MAX: float = TRAIN_CONFIG["velocity_max"]
+SPEED_XY: float = TRAIN_CONFIG["reposition_speed_xy"]
+SPEED_Z: float = TRAIN_CONFIG["reposition_speed_z"]
+L_STRIKE: float = TRAIN_CONFIG["l_strike"]
+L_STRIKE_MIN: float = TRAIN_CONFIG["l_strike_min"]
+STRIKE_CONTROL_FREQ: int = TRAIN_CONFIG["strike_control_freq"]
+STRIKE_DT: float = 1.0 / STRIKE_CONTROL_FREQ
+STRIKE_MAX_DURATION: float = TRAIN_CONFIG["strike_max_duration"]
+STRIKE_MIN_STEPS: int = TRAIN_CONFIG["strike_min_steps"]
 FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
-STANDOFF_CLEARANCE: float = 0.01  # gap between fingertip sphere and object
-OVERTRAVEL: float = 0.05          # DEPRECATED — delta_d now controls penetration symmetrically
-POKE_Z: float = OBJECT_HEIGHT * 0.5  # side-poke height at object midline
-SAFE_Z: float = POKE_Z
-FINGER_TRACK_TOL: float = 0.003   # metres — phase target convergence tolerance
+POKE_Z: float = OBJECT_HEIGHT * 0.5
+SAFE_Z: float = TRAIN_CONFIG["safe_z"]
+TARGET_MIN_CLEARANCE: float = OBJECT_CONFIG["min_initial_clearance"]
+TARGET_RESAMPLE_ATTEMPTS: int = OBJECT_CONFIG["pose_resample_attempts"]
 
 # yaw training controls
-# Stage A: keep target yaw equal to current yaw, softly discourage yaw drift,
-#          but let success depend on translation only.
-# Stage B: load weights-only, clear replay, set YAW_TARGET_MODE="curriculum"
-#          or "fixed", and enable yaw success.
-YAW_TARGET_MODE: str = "preserve"       # "preserve", "curriculum", or "fixed"
-C_YAW: float = 0.1                      # weight on orientation progress reward
-YAW_REWARD_ENABLED: bool = True         # soft yaw preservation/control reward
-YAW_SUCCESS_ENABLED: bool = False       # include yaw threshold in done/success
-YAW_THRESHOLD: float = np.deg2rad(10)   # radians — tolerance for yaw success
-YAW_CURRICULUM_START: int = 0           # episode to begin expanding yaw range
-YAW_CURRICULUM_END: int = 500           # episode to reach full yaw range
-YAW_FULL_RANGE: float = np.pi           # radians — ±180° full orientation
+YAW_TARGET_MODE: str = TRAIN_CONFIG["yaw_target_mode"]
+C_YAW: float = TRAIN_CONFIG["c_yaw"]
+YAW_REWARD_ENABLED: bool = TRAIN_CONFIG["yaw_reward_enabled"]
+YAW_SUCCESS_ENABLED: bool = TRAIN_CONFIG["yaw_success_enabled"]
+YAW_THRESHOLD: float = np.deg2rad(TRAIN_CONFIG["yaw_threshold_deg"])
+YAW_CURRICULUM_START: int = TRAIN_CONFIG["yaw_curriculum_start_ep"]
+YAW_CURRICULUM_END: int = TRAIN_CONFIG["yaw_curriculum_end_ep"]
+YAW_FULL_RANGE: float = np.pi
 
-TRAIN_AFTER: int = 1_024         # start training after this many transitions
-TRAIN_EVERY: int = 1             # train every N env steps
-GRAD_UPDATES_PER_STEP: int = 4   # replay updates per env step
+TRAIN_AFTER: int = TRAIN_CONFIG["train_after"]
+TRAIN_EVERY: int = TRAIN_CONFIG["train_every"]
+GRAD_UPDATES_PER_STEP: int = TRAIN_CONFIG["grad_updates_per_step"]
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-CHECKPOINT_EVERY: int = 100       # episodes between saves
-CHECKPOINT_KEEP: int = 3          # how many recent checkpoints to keep
-SHOW_PLANE_OVERLAY: bool = True   # draw workspace/camera view footprints
-PLANE_OVERLAY_THICKNESS: float = 0.003
-PLANE_OVERLAY_OPACITY: float = 0.18
-SHOW_TARGET_OVERLAY: bool = True  # draw per-env target poses in the USD scene
-TARGET_OVERLAY_Z_OFFSET: float = 0.015
-TARGET_OVERLAY_THICKNESS: float = 0.006
-TARGET_OVERLAY_OPACITY: float = 0.2
-SHOW_ACTION_OVERLAY: bool = True  # draw selected poke standoff/contact/strike
-ACTION_OVERLAY_Z_OFFSET: float = 0.01
+CHECKPOINT_EVERY: int = TRAIN_CONFIG["checkpoint_every"]
+CHECKPOINT_KEEP: int = TRAIN_CONFIG["checkpoint_keep"]
+SHOW_PLANE_OVERLAY: bool = TRAIN_CONFIG["show_plane_overlay"]
+PLANE_OVERLAY_THICKNESS: float = TRAIN_CONFIG["plane_overlay_thickness"]
+PLANE_OVERLAY_OPACITY: float = TRAIN_CONFIG["plane_overlay_opacity"]
+SHOW_TARGET_OVERLAY: bool = TRAIN_CONFIG["show_target_overlay"]
+TARGET_OVERLAY_Z_OFFSET: float = TRAIN_CONFIG["target_overlay_z_offset"]
+TARGET_OVERLAY_THICKNESS: float = TRAIN_CONFIG["target_overlay_thickness"]
+TARGET_OVERLAY_OPACITY: float = TRAIN_CONFIG["target_overlay_opacity"]
+SHOW_ACTION_OVERLAY: bool = TRAIN_CONFIG["show_action_overlay"]
+ACTION_OVERLAY_Z_OFFSET: float = TRAIN_CONFIG["action_overlay_z_offset"]
 
 
 #* ================================================================
@@ -178,7 +191,7 @@ class ReplayBuffer:
         self.x        = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
         self.pixel    = torch.zeros(capacity, 2, dtype=torch.long)
         self.d_xy     = torch.zeros(capacity, 2)
-        self.delta_d  = torch.zeros(capacity, 1)
+        self.velocity = torch.zeros(capacity, 1)
         self.r        = torch.zeros(capacity, 1)
         self.x_next   = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
         self.done     = torch.zeros(capacity, 1, dtype=torch.bool)
@@ -191,7 +204,7 @@ class ReplayBuffer:
         x: torch.Tensor,             # (1, 2, H, W) float32 binary contours
         pixel_ij: np.ndarray,        # (2,) int
         d_xy: np.ndarray,            # (2,)
-        delta_d: float,
+        velocity: float,
         reward: float,
         x_next: torch.Tensor,        # (1, 2, H, W) float32
         done: bool,
@@ -203,7 +216,7 @@ class ReplayBuffer:
         self.x[idx].copy_(_x.cpu() if _x.device.type != "cpu" else _x)
         self.pixel[idx] = torch.tensor(pixel_ij)
         self.d_xy[idx] = torch.tensor(d_xy)
-        self.delta_d[idx] = torch.tensor([delta_d])
+        self.velocity[idx] = torch.tensor([velocity])
         self.r[idx] = torch.tensor([reward])
         self.x_next[idx].copy_(_xn.cpu() if _xn.device.type != "cpu" else _xn)
         self.done[idx] = torch.tensor([done])
@@ -219,7 +232,7 @@ class ReplayBuffer:
             "x":         x,
             "pixel":     self.pixel[indices].to(self.device),
             "d_xy":      self.d_xy[indices].to(self.device),
-            "delta_d":   self.delta_d[indices].to(self.device),
+            "velocity":  self.velocity[indices].to(self.device),
             "r":         self.r[indices].to(self.device),
             "x_next":    x_next,
             "done":      self.done[indices].to(self.device),
@@ -268,18 +281,93 @@ def sample_target_poses(
     rng: np.random.Generator,
     num_envs: int,
     workspace_range: tuple = (-0.20, 0.20),
+    l_yaws: np.ndarray | None = None,
+    min_clearance: float = TARGET_MIN_CLEARANCE,
+    resample_attempts: int = TARGET_RESAMPLE_ATTEMPTS,
 ) -> dict[str, np.ndarray]:
     """Random 2-D target on the table for each object and each env.
 
+    Reject samples where the cylinder target overlaps the L target footprint.
     Returns dict: obj_name → (num_envs, 3)  (z = OBJECT_HEIGHT * 0.5)
     """
     z = np.full((num_envs,), OBJECT_HEIGHT * 0.5, dtype=np.float32)
-    lx = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
-    ly = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
-    cx = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
-    cy = rng.uniform(workspace_range[0], workspace_range[1], size=(num_envs,))
+    l_yaws = np.zeros(num_envs, dtype=np.float32) if l_yaws is None else np.asarray(l_yaws)
+    lx = np.zeros(num_envs, dtype=np.float32)
+    ly = np.zeros(num_envs, dtype=np.float32)
+    cx = np.zeros(num_envs, dtype=np.float32)
+    cy = np.zeros(num_envs, dtype=np.float32)
+
+    for env_idx in range(num_envs):
+        best_sample = None
+        best_clearance = -float("inf")
+        for _ in range(max(1, resample_attempts)):
+            sample_l = rng.uniform(workspace_range[0], workspace_range[1], size=(2,)).astype(np.float32)
+            sample_c = rng.uniform(workspace_range[0], workspace_range[1], size=(2,)).astype(np.float32)
+            clearance = l_object_cylinder_clearance(
+                sample_l, float(l_yaws[env_idx]), sample_c
+            )
+            if clearance > best_clearance:
+                best_clearance = clearance
+                best_sample = (sample_l, sample_c)
+            if clearance >= min_clearance:
+                break
+
+        sample_l, sample_c = best_sample
+        lx[env_idx], ly[env_idx] = sample_l
+        cx[env_idx], cy[env_idx] = sample_c
+
     return {"LObject":  np.stack([lx, ly, z], axis=-1),
             "Cylinder": np.stack([cx, cy, z], axis=-1)}
+
+
+def compute_adaptive_strike_lengths(
+    pixel_ij: np.ndarray,
+    poses: dict,
+    targets: dict[str, np.ndarray],
+    env_root_pos: np.ndarray,
+    K: np.ndarray,
+    active: np.ndarray | None = None,
+    min_length: float = L_STRIKE_MIN,
+    max_length: float = L_STRIKE,
+) -> np.ndarray:
+    """Shrink strike travel when the selected object is close to its target."""
+    num_envs = pixel_ij.shape[0]
+    lengths = np.full(num_envs, max_length, dtype=np.float32)
+    env_offsets = env_root_pos[:, :2]
+
+    contact_xy = np.zeros((num_envs, 2), dtype=np.float32)
+    for b in range(num_envs):
+        contact_xy[b] = pixel_to_world(tuple(pixel_ij[b]), K)[:2]
+
+    object_names = list(targets.keys())
+    object_local_xy = []
+    object_target_dist = []
+    for obj_name in object_names:
+        local_xy = poses[obj_name][0][:, :2].copy() - env_offsets
+        object_local_xy.append(local_xy)
+        object_target_dist.append(
+            np.linalg.norm(local_xy - targets[obj_name][:, :2], axis=1)
+        )
+
+    object_local_xy = np.stack(object_local_xy, axis=0)        # (O, B, 2)
+    object_target_dist = np.stack(object_target_dist, axis=0)  # (O, B)
+    contact_dist = np.linalg.norm(
+        object_local_xy - contact_xy[None, :, :], axis=2
+    )
+    selected_obj_idx = np.argmin(contact_dist, axis=0)
+    env_idx = np.arange(num_envs)
+    selected_target_dist = object_target_dist[selected_obj_idx, env_idx]
+
+    adaptive_lengths = np.clip(
+        2.0 * selected_target_dist,
+        min_length,
+        max_length,
+    ).astype(np.float32)
+    if active is None:
+        lengths = adaptive_lengths
+    else:
+        lengths[active] = adaptive_lengths[active]
+    return lengths
 
 
 def _ensure_xform(stage, path: str):
@@ -492,7 +580,8 @@ def update_action_overlay(pixel_ij: np.ndarray,
                           d_xy: np.ndarray,
                           delta_d: np.ndarray,
                           K: np.ndarray,
-                          active: np.ndarray | None = None):
+                          active: np.ndarray | None = None,
+                          strike_lengths: np.ndarray | None = None):
     """Draw the selected side-poke action for each env."""
     if not SHOW_ACTION_OVERLAY or not _HAS_ISAAC:
         return
@@ -501,8 +590,11 @@ def update_action_overlay(pixel_ij: np.ndarray,
     dir_norm = np.linalg.norm(d_xy, axis=1, keepdims=True)
     dir_norm = np.where(dir_norm < 1e-8, 1.0, dir_norm)
     dirs = d_xy / dir_norm
-    min_standoff = FINGERTIP_RADIUS + STANDOFF_CLEARANCE
-    delta_d_clipped = np.clip(delta_d, min_standoff, DELTA_D_MAX)
+    strike_lengths = (
+        np.full(NUM_ENVS, L_STRIKE, dtype=np.float32)
+        if strike_lengths is None
+        else np.asarray(strike_lengths, dtype=np.float32)
+    )
 
     marker_radius = 0.01
     line_thickness = 0.004
@@ -522,9 +614,10 @@ def update_action_overlay(pixel_ij: np.ndarray,
 
         world = pixel_to_world(tuple(pixel_ij[env_idx]), K)
         world_xy = world[:2]
-        standoff_xy = world_xy - dirs[env_idx] * delta_d_clipped[env_idx]
+        l_env = float(strike_lengths[env_idx])
+        standoff_xy = world_xy - dirs[env_idx] * (l_env / 2.0)
         contact_xy = world_xy - dirs[env_idx] * FINGERTIP_RADIUS   # sphere touches surface
-        strike_xy = world_xy + dirs[env_idx] * delta_d_clipped[env_idx]  # symmetric
+        strike_xy = world_xy + dirs[env_idx] * (l_env / 2.0)
 
         points = {
             "Standoff": (standoff_xy, (0.0, 0.25, 1.0)),
@@ -674,7 +767,7 @@ def select_action(
     noise_std: float,
     heuristic_actions: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     top_k: int = 5,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Select actions for a batch of observations.
 
     Greedy envs use per-pixel FiLM-conditioned pixel selection (top-K
@@ -686,7 +779,9 @@ def select_action(
     -------
     pixel_ij : (B, 2) int   — (row, col) per env
     d_xy     : (B, 2) float — normalised unit vector
-    delta_d  : (B,)  float — standoff in [0, delta_d_max]
+    delta_d  : (B,)  float — poke velocity in [0, VELOCITY_MAX]
+    is_policy: (B,)  bool  — True when selected by greedy policy branch
+    greedy_v : (B,)  float — policy velocity at greedy pixel before noise
     """
     B = x.shape[0]
     device = x.device
@@ -694,7 +789,9 @@ def select_action(
 
     pixel_ij = np.zeros((B, 2), dtype=np.int32)
     d_xy_arr = np.zeros((B, 2), dtype=np.float32)
-    delta_d_arr = np.zeros(B, dtype=np.float32)
+    velocity_arr = np.zeros(B, dtype=np.float32)
+    is_policy = np.zeros(B, dtype=bool)
+    greedy_velocity_arr = np.zeros(B, dtype=np.float32)
 
     with torch.no_grad():
         # one U-Net pass — features + per-pixel params
@@ -702,10 +799,15 @@ def select_action(
 
         # batched greedy pixel selection (per-pixel FiLM conditioned)
         greedy_pix, _ = actor_critic.greedy_pixel(f, params, contour_masks, top_k=top_k)
+        batch_idx = torch.arange(B, device=device)
+        greedy_velocity_arr = (
+            params[batch_idx, 2, greedy_pix[:, 0], greedy_pix[:, 1]]
+            .detach().cpu().numpy().astype(np.float32)
+        )
 
         for b in range(B):
             if contour_masks[b].sum() == 0:
-                delta_d_arr[b] = 0.0           # no-op poke (empty contour)
+                velocity_arr[b] = 0.0           # no-op poke (empty contour)
                 continue
 
             if np.random.random() < epsilon:
@@ -729,13 +831,34 @@ def select_action(
                 p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
                 d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
                 dd_noisy = p[2] + abs(np.float32(np.random.randn())) * noise_std
+                is_policy[b] = True
 
             # clamp & normalise direction
             norm = np.linalg.norm(d_noisy) + 1e-8
             d_xy_arr[b] = d_noisy / norm
-            delta_d_arr[b] = np.clip(dd_noisy, 0.0, actor_critic.delta_d_max)
+            velocity_arr[b] = np.clip(dd_noisy, 0.0, actor_critic.velocity_max)
 
-    return pixel_ij, d_xy_arr, delta_d_arr
+    return pixel_ij, d_xy_arr, velocity_arr, is_policy, greedy_velocity_arr
+
+
+def contact_velocity_from_command(
+    v_mid: np.ndarray,
+    strike_lengths: np.ndarray | None = None,
+) -> np.ndarray:
+    """Actual midpoint/contact speed after strike-duration clamping."""
+    values = np.asarray(v_mid, dtype=np.float32)
+    lengths = (
+        np.full_like(values, L_STRIKE, dtype=np.float32)
+        if strike_lengths is None
+        else np.asarray(strike_lengths, dtype=np.float32)
+    )
+    out = np.zeros_like(values, dtype=np.float32)
+    for idx, v in np.ndenumerate(values):
+        T, _ = compute_strike_params(
+            float(v), float(lengths[idx]), STRIKE_DT, STRIKE_MAX_DURATION, STRIKE_MIN_STEPS
+        )
+        out[idx] = (lengths[idx] / T) * quintic_poly_derivative(0.5)
+    return out
 
 
 
@@ -876,18 +999,21 @@ async def env_step_async(
     fingers: Articulation,
     pixel_ij: np.ndarray,        # (B, 2)
     d_xy: np.ndarray,            # (B, 2)
-    delta_d: np.ndarray,         # (B,)
+    delta_d: np.ndarray,         # (B,)  — velocity magnitude from policy (v_mid)
     K: np.ndarray,
     active: np.ndarray | None = None,  # (B,) bool — which envs to control
+    fingertip_masses: np.ndarray | None = None,  # (B,) kg per env (randomized or default)
+    strike_lengths: np.ndarray | None = None,  # (B,) adaptive total strike travel
 ) -> tuple[dict, np.ndarray]:
     """Execute strikes with the prismatic XYZ finger robot.
 
     Phases:
-      0. move to side-poke height
-      1. move to standoff_xy at side-poke height
-      2. settle briefly at standoff
-      3. strike — push Δd forward past the contour (world_xy is midpoint)
-      4. retract back to standoff_xy at side-poke height
+      0. lift Z to safe height (constant velocity)
+      1. move XY to standoff at safe height (constant velocity)
+      2. drop Z to poke height (constant velocity)
+      3. quintic strike — smooth trajectory over adaptive L; contact at midpoint;
+         position-offset feedforward via q_target += m*a / kp
+      4. lift Z to safe height (constant velocity, XY stays)
       5. settle objects
 
     Inactive envs (where active=False) are frozen at their current position
@@ -906,18 +1032,21 @@ async def env_step_async(
     dir_norm = np.linalg.norm(d_xy, axis=1, keepdims=True)
     dir_norm = np.where(dir_norm < 1e-8, 1.0, dir_norm)
     dirs = d_xy / dir_norm
+    L_arr = (
+        np.full(B, L_STRIKE, dtype=np.float32)
+        if strike_lengths is None
+        else np.clip(np.asarray(strike_lengths, dtype=np.float32), L_STRIKE_MIN, L_STRIKE)
+    )
 
-    zero_v = np.zeros((B, 3), dtype=np.float32)
     xy_low  = np.array(LIMIT_LOWER[:2], dtype=np.float32)
     xy_high = np.array(LIMIT_UPPER[:2], dtype=np.float32)
 
-    #* ── standoff from Δd ────────────────────────────────────────────
-    #* world_xy is a contour point. The controlled point is the sphere centre,
-    #* so keep at least one fingertip radius plus clearance outside the object.
-    min_standoff = FINGERTIP_RADIUS + STANDOFF_CLEARANCE
-    delta_d_clipped = np.clip(delta_d, min_standoff, DELTA_D_MAX)
-    standoff_xy = world_xy - dirs * delta_d_clipped[:, None]  # (B, 2) run-up (half Δd behind)
-    strike_xy = world_xy + dirs * delta_d_clipped[:, None]     # (B, 2) symmetric penetration forward
+    #* ── standoff / strike geometry ─────────────────────────────────
+    #* world_xy is the contour contact point.  Quintic trajectory places the
+    #* contact at the time-midpoint → standoff 0.5L behind, strike 0.5L ahead.
+    #* L_arr is the total travel: 0.5L behind contact, 0.5L ahead.
+    standoff_xy = world_xy - dirs * (L_arr[:, None] / 2.0)
+    strike_xy   = world_xy + dirs * (L_arr[:, None] / 2.0)
 
     #* ── snap initial positions (inactive envs hold these throughout) ──
     try:
@@ -927,72 +1056,141 @@ async def env_step_async(
         await _step_physics(2)
         q_cur = as_numpy(fingers.get_dof_positions()).copy()
 
+    active_mask = active if active is not None else np.ones(B, dtype=bool)
+
     def _hold_inactive(targets: np.ndarray):
-        if active is not None:
-            targets[~active] = q_cur[~active]
+        targets[~active_mask] = q_cur[~active_mask]
 
-    async def _drive_to(targets: np.ndarray, max_steps: int,
-                         donasdatol: float = FINGER_TRACK_TOL):
-        fingers.set_dof_position_targets(positions=targets.tolist(), dof_indices=dof_indices)
-        fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-        if active is not None and not np.any(active):
-            await _step_physics(1)
-            return
-        for step_idx in range(max_steps):
-            await _step_physics(1)
-            try:
-                q_now = as_numpy(fingers.get_dof_positions())
-            except AssertionError:
-                app_utils.play()
-                await _step_physics(2)
-                try:
-                    q_now = as_numpy(fingers.get_dof_positions())
-                except AssertionError:
-                    await _step_physics(max(0, max_steps - step_idx - 1))
-                    break
-            err = np.linalg.norm(q_now - targets, axis=1)
-            if active is not None:
-                err = err[active]
-            if err.size > 0 and float(np.max(err)) <= tol:
-                break
+    async def _constant_velocity_phase(targets: np.ndarray, speed: float):
+        """Move to *targets* at constant speed with position+velocity trajectory.
 
-    #* ── Phase 0: move to side-poke height above current XY ──────────
+        Each env linearly interpolates from its current position to *targets*
+        at *speed* (m/s).  Inactive envs are held throughout.
+        """
+        q_start_phase = as_numpy(fingers.get_dof_positions()).copy()
+        displacement = targets - q_start_phase
+        distance = np.linalg.norm(displacement, axis=1)
+        n_needed = np.maximum(1, (distance / np.maximum(speed, 0.01) / (1.0 / 60)).astype(int) + 1)
+        global_n_phase = int(n_needed[active_mask].max()) if active_mask.any() else 1
+
+        for k in range(global_n_phase):
+            still = active_mask & (k < n_needed)
+
+            q_des_phase = q_start_phase.copy()
+            v_des_phase = np.zeros((B, 3), dtype=np.float32)
+
+            if still.any():
+                alpha = (k + 1) / n_needed[still]
+                q_des_phase[still] = q_start_phase[still] + alpha[:, None] * displacement[still]
+                v_norm = np.linalg.norm(displacement[still], axis=1, keepdims=True) + 1e-8
+                v_des_phase[still] = displacement[still] * (speed / v_norm)
+
+            finished = active_mask & (k >= n_needed)
+            if finished.any():
+                q_des_phase[finished] = targets[finished]
+
+            q_des_phase[:, :2] = np.clip(q_des_phase[:, :2], xy_low, xy_high)
+            fingers.set_dof_position_targets(positions=q_des_phase.tolist(), dof_indices=dof_indices)
+            fingers.set_dof_velocity_targets(velocities=v_des_phase.tolist(), dof_indices=dof_indices)
+            await _step_physics(1)
+
+    #* ── Phase 0: lift to side-poke height above current XY ──────────
     q0 = q_cur.copy()
-    q0[:, 2] = POKE_Z
+    q0[:, 2] = SAFE_Z
     _hold_inactive(q0)
-    await _drive_to(q0, max_steps=60)
+    await _constant_velocity_phase(q0, SPEED_Z)
 
     #* ── Phase 1: move to standoff at side-poke height ──────────────
     q1 = np.zeros((B, 3), dtype=np.float32)
     q1[:, :2] = np.clip(standoff_xy, xy_low, xy_high)
-    q1[:, 2] = POKE_Z
+    q1[:, 2] = SAFE_Z
     _hold_inactive(q1)
-    await _drive_to(q1, max_steps=120)
+    await _constant_velocity_phase(q1, SPEED_XY)
 
-    #* ── Phase 2: hold standoff before impact ───────────────────────
+    #* ── Phase 2: drop down to poke height ──────────────────────────
     q2 = q1.copy()
     q2[:, 2] = POKE_Z
     _hold_inactive(q2)
-    await _drive_to(q2, max_steps=30)
+    await _constant_velocity_phase(q2, SPEED_Z)
 
-    #* ── Phase 3: strike — symmetric push past contour ────────────
-    #* world_xy is the midpoint; the finger pushes Δd forward past it.
-    #* Position-only PD (v_target=0): OVERTRAVEL via Δd creates a steady
-    #* pushing force kp*Δd.  No velocity target avoids oscillation at contact.
-    q3 = np.zeros((B, 3), dtype=np.float32)
-    q3[:, :2] = np.clip(strike_xy, xy_low, xy_high)
-    q3[:, 2] = POKE_Z
-    _hold_inactive(q3)
+    #* ── Phase 3: quintic strike trajectory ─────────────────────────
+    #* Capture position after Phase 2 as trajectory origin.
+    #* Each active env follows a quintic polynomial from standoff → through
+    #* contour at midpoint → strike_xy, with per-env timing set by v_mid.
+    q_start = as_numpy(fingers.get_dof_positions()).copy()  # (B, 3)
 
-    fingers.set_dof_position_targets(positions=q3.tolist(), dof_indices=dof_indices)
-    fingers.set_dof_velocity_targets(velocities=zero_v.tolist(), dof_indices=dof_indices)
-    await _step_physics(IMPACT_STEPS)
+    # Per-env trajectory parameters
+    active_mask = active if active is not None else np.ones(B, dtype=bool)
+    n_steps = np.ones(B, dtype=int)
+    T_arr = np.ones(B, dtype=np.float32)
 
-    #* ── Phase 4: retract back to standoff at side-poke height ───────
-    q4 = q2.copy()
-    q4[:, 2] = POKE_Z
+    for b in range(B):
+        if active_mask[b]:
+            T_arr[b], n_steps[b] = compute_strike_params(
+                delta_d[b], L_arr[b], STRIKE_DT, STRIKE_MAX_DURATION, STRIKE_MIN_STEPS)
+
+    global_n = int(n_steps[active_mask].max()) if active_mask.any() else 1
+
+    # Mass & stiffness for feedforward (position-offset: q_target += F_ff / kp)
+    if fingertip_masses is not None:
+        m_ff = np.asarray(fingertip_masses, dtype=np.float32).ravel()
+        m_ff = np.maximum(m_ff, 0.01)
+    else:
+        m_ff = np.full(B, FINGER_CONFIG["default_fingertip_mass"], dtype=np.float32)
+    kp_default = float(FINGER_CONFIG["drive_stiffness"])
+
+    for k in range(global_n):
+        still_running = active_mask & (k < n_steps)
+
+        q_des = q_start.copy()  # default: hold at Phase 2 position
+        v_des = np.zeros((B, 3), dtype=np.float32)
+
+        if still_running.any():
+            u = (k + 1) / n_steps[still_running]  # normalised time [1/N, 1]
+
+            s_nd = quintic_poly_query(u)                   # position scale [0, 1]
+            v_nd = quintic_poly_derivative(u)               # velocity derivative
+            a_nd = quintic_poly_second_derivative(u)        # acceleration derivative
+
+            # Position target along direction
+            L_running = L_arr[still_running]
+            displacement = L_running * s_nd
+            q_des[still_running, :2] = (
+                q_start[still_running, :2]
+                + dirs[still_running] * displacement[:, np.newaxis]
+            )
+
+            # Velocity target
+            velocity = (L_running / T_arr[still_running]) * v_nd
+            v_des[still_running, :2] = dirs[still_running] * velocity[:, np.newaxis]
+
+            # Feedforward: F_ff = m * a, injected via position offset
+            acceleration = (L_running / T_arr[still_running] ** 2) * a_nd
+            F_ff = m_ff[still_running] * acceleration
+            ff_offset = F_ff / kp_default
+            q_des[still_running, :2] += dirs[still_running] * ff_offset[:, np.newaxis]
+
+            # Z stays at poke height
+            q_des[still_running, 2] = POKE_Z
+
+        # Hold already-finished envs at strike endpoint
+        finished = active_mask & (k >= n_steps)
+        if finished.any():
+            q_des[finished, :2] = np.clip(strike_xy[finished], xy_low, xy_high)
+            q_des[finished, 2] = POKE_Z
+
+        # Clip XY to joint limits
+        q_des[:, :2] = np.clip(q_des[:, :2], xy_low, xy_high)
+
+        fingers.set_dof_position_targets(positions=q_des.tolist(), dof_indices=dof_indices)
+        fingers.set_dof_velocity_targets(velocities=v_des.tolist(), dof_indices=dof_indices)
+        await _step_physics(1)
+
+    #* ── Phase 4: lift straight up — keep XY, raise Z to safe height ──
+    q4 = as_numpy(fingers.get_dof_positions()).copy()
+    q4[:, 2] = SAFE_Z
     _hold_inactive(q4)
-    await _drive_to(q4, max_steps=80)
+    await _constant_velocity_phase(q4, SPEED_Z)
 
     #* ── Phase 5: settle briefly, then clear residual object velocities ─
     SETTLE_STEPS = 30
@@ -1026,7 +1224,7 @@ def train_step(
     x       = batch["x"]
     pixel   = batch["pixel"]       # (B, 2)
     d_xy_st = batch["d_xy"]        # (B, 2)  stored (with noise)
-    dd_st   = batch["delta_d"]     # (B, 1)
+    v_st    = batch["velocity"]      # (B, 1)  stored velocity (m/s)
     r       = batch["r"]           # (B, 1)
     x_next  = batch["x_next"]
     done    = batch["done"]        # (B, 1)
@@ -1038,7 +1236,7 @@ def train_step(
     target_net.eval()
 
     #* -- stored action params (with exploration noise, as executed) -----
-    a_stored = torch.cat([d_xy_st, dd_st], dim=1)  # (B, 3)
+    a_stored = torch.cat([d_xy_st, v_st], dim=1)  # (B, 3)
 
     #* =================================================================
     #*  LOSS 1 — Q-Loss (Huber TD)
@@ -1128,8 +1326,8 @@ class Trainer:
     """Orchestrates the training loop inside the Isaac Sim Script Editor."""
 
     def __init__(self):
-        self.actor_critic = SpatialActorCritic(delta_d_max=DELTA_D_MAX).to(DEVICE)
-        self.target_net   = SpatialActorCritic(delta_d_max=DELTA_D_MAX).to(DEVICE)
+        self.actor_critic = SpatialActorCritic(velocity_max=VELOCITY_MAX).to(DEVICE)
+        self.target_net   = SpatialActorCritic(velocity_max=VELOCITY_MAX).to(DEVICE)
         soft_update(self.target_net, self.actor_critic, tau=1.0)  # copy
 
         #* param groups for separate optimizers
@@ -1162,8 +1360,10 @@ class Trainer:
             configure_drives(self.fingers,
                              stiffnesses=finger_props["stiffnesses"],
                              dampings=finger_props["dampings"])
+            self._finger_masses = finger_props["fingertip_masses"].ravel().astype(np.float32)
         else:
             configure_drives(self.fingers)
+            self._finger_masses = None
 
         self.K = get_camera_intrinsics()
         update_plane_overlays(self.K)
@@ -1216,9 +1416,6 @@ class Trainer:
         self.fingers.set_dof_velocity_targets(velocities=init_vel.tolist(), dof_indices=dof_idx)
         await _step_physics(30)  # let PD converge to centre
 
-        # random position targets
-        targets_pos = sample_target_poses(self.rng, NUM_ENVS)
-
         # query current object poses for yaw curriculum
         poses_before, env_root_pos = get_object_poses_vectorized()
 
@@ -1232,6 +1429,9 @@ class Trainer:
         yaw_half_range = yaw_target_half_range(episode)
         l_target_yaws = l_yaws + self.rng.uniform(-yaw_half_range, yaw_half_range,
                                                    size=NUM_ENVS)
+        targets_pos = sample_target_poses(
+            self.rng, NUM_ENVS, l_yaws=l_target_yaws.astype(np.float32)
+        )
         targets_ori["LObject"] = _yaws_to_quats(l_target_yaws.astype(np.float32))
         update_target_overlay(targets_pos, targets_ori)
 
@@ -1258,6 +1458,11 @@ class Trainer:
         active_counts = []
         ep_active_steps = 0
         final_has_contour = np.ones(NUM_ENVS, dtype=bool)
+        selected_velocity_samples = []
+        contact_velocity_samples = []
+        greedy_velocity_samples = []
+        strike_length_samples = []
+        policy_selected_count = 0
 
         for step in range(MAX_STEPS):
             has_contour = contour_masks.any(dim=(-2, -1)).cpu().numpy()
@@ -1280,17 +1485,42 @@ class Trainer:
                 self._env_root_pos,
                 self.K,
             )
-            pixel_ij, d_xy, delta_d = select_action(
+            pixel_ij, d_xy, delta_d, is_policy_action, greedy_velocity = select_action(
                 self.actor_critic, x, contour_masks,
                 self.epsilon, self.noise_std,
                 heuristic_actions=heuristic_actions,
             )
-            update_action_overlay(pixel_ij, d_xy, delta_d, self.K, active=was_active)
+            strike_lengths = compute_adaptive_strike_lengths(
+                pixel_ij,
+                poses_before,
+                self._targets_pos,
+                self._env_root_pos,
+                self.K,
+                active=was_active,
+            )
+            if was_active.any():
+                selected_velocity_samples.append(delta_d[was_active])
+                contact_velocity_samples.append(
+                    contact_velocity_from_command(
+                        delta_d[was_active],
+                        strike_lengths[was_active],
+                    )
+                )
+                greedy_velocity_samples.append(greedy_velocity[was_active])
+                strike_length_samples.append(strike_lengths[was_active])
+                policy_selected_count += int((is_policy_action & was_active).sum())
+            update_action_overlay(
+                pixel_ij, d_xy, delta_d, self.K,
+                active=was_active,
+                strike_lengths=strike_lengths,
+            )
 
             #* — execute (only active envs move; inactive held frozen) —
             poses_after, _ = await env_step_async(
                 self.fingers, pixel_ij, d_xy, delta_d, self.K,
                 active=was_active,
+                fingertip_masses=self._finger_masses,
+                strike_lengths=strike_lengths,
             )
             rewards, dones, self._done_once = compute_rewards(
                 poses_before, poses_after,
@@ -1350,8 +1580,50 @@ class Trainer:
         self._last_ep_active_steps = ep_active_steps
         self._last_done_count = int(self._done_once.sum())
         self._last_lost_count = int((~final_has_contour).sum())
+        self._last_velocity_stats = self._summarize_velocity_stats(
+            selected_velocity_samples,
+            contact_velocity_samples,
+            greedy_velocity_samples,
+            strike_length_samples,
+            policy_selected_count,
+            ep_active_steps,
+        )
 
         return ep_return, ep_len
+
+    @staticmethod
+    def _mean_max(samples: list[np.ndarray]) -> tuple[float, float]:
+        if not samples:
+            return 0.0, 0.0
+        values = np.concatenate(samples)
+        if values.size == 0:
+            return 0.0, 0.0
+        return float(values.mean()), float(values.max())
+
+    def _summarize_velocity_stats(
+        self,
+        selected_samples: list[np.ndarray],
+        contact_samples: list[np.ndarray],
+        greedy_samples: list[np.ndarray],
+        strike_length_samples: list[np.ndarray],
+        policy_selected_count: int,
+        active_steps: int,
+    ) -> dict[str, float]:
+        sel_mean, sel_max = self._mean_max(selected_samples)
+        contact_mean, contact_max = self._mean_max(contact_samples)
+        greedy_mean, greedy_max = self._mean_max(greedy_samples)
+        strike_l_mean, strike_l_max = self._mean_max(strike_length_samples)
+        return {
+            "selected_mean": sel_mean,
+            "selected_max": sel_max,
+            "contact_mean": contact_mean,
+            "contact_max": contact_max,
+            "greedy_mean": greedy_mean,
+            "greedy_max": greedy_max,
+            "strike_l_mean": strike_l_mean,
+            "strike_l_max": strike_l_max,
+            "policy_frac": policy_selected_count / max(1, active_steps),
+        }
 
     def log(self, episode: int, ep_return: float, ep_len: int, elapsed: float):
         avg_r = np.mean(self.ep_returns) if self.ep_returns else 0.0
@@ -1360,10 +1632,24 @@ class Trainer:
         active_steps = getattr(self, "_last_ep_active_steps", 0)
         done_count = getattr(self, "_last_done_count", 0)
         lost_count = getattr(self, "_last_lost_count", 0)
+        velocity_stats = getattr(self, "_last_velocity_stats", {})
         r_per_active = ep_return / max(1, active_steps)
         active_summary = ""
         if active_counts:
             active_summary = f"  active={active_counts[0]}→{active_counts[-1]}"
+        velocity_summary = ""
+        if velocity_stats:
+            velocity_summary = (
+                f"  sel_v={velocity_stats['selected_mean']:.3f}/"
+                f"{velocity_stats['selected_max']:.3f}"
+                f"  contact_v={velocity_stats['contact_mean']:.3f}/"
+                f"{velocity_stats['contact_max']:.3f}"
+                f"  greedy_v={velocity_stats['greedy_mean']:.3f}/"
+                f"{velocity_stats['greedy_max']:.3f}"
+                f"  strike_L={velocity_stats['strike_l_mean']:.3f}/"
+                f"{velocity_stats['strike_l_max']:.3f}"
+                f"  policy={100.0 * velocity_stats['policy_frac']:.1f}%"
+            )
         print(
             f"[ep {episode:5d}] "
             f"return={ep_return:7.2f}  len={ep_len:3d}  "
@@ -1372,6 +1658,7 @@ class Trainer:
             f"ε={self.epsilon:.3f}  σ={self.noise_std:.3f}  "
             f"buf={self.buffer.size:6d}  dt={elapsed:.1f}s  "
             f"done={done_count:2d}  lost={lost_count:2d}"
+            f"{velocity_summary}"
             f"{active_summary}"
         )
 
@@ -1397,7 +1684,7 @@ class Trainer:
             "buffer_x_next":  self.buffer.x_next[:self.buffer.size],
             "buffer_pixel":   self.buffer.pixel[:self.buffer.size],
             "buffer_d_xy":    self.buffer.d_xy[:self.buffer.size],
-            "buffer_delta_d": self.buffer.delta_d[:self.buffer.size],
+            "buffer_velocity": self.buffer.velocity[:self.buffer.size],
             "buffer_r":       self.buffer.r[:self.buffer.size],
             "buffer_done":    self.buffer.done[:self.buffer.size],
             "buffer_ptr":     self.buffer.ptr,
@@ -1437,7 +1724,7 @@ class Trainer:
         self.buffer.x_next[:s].copy_(ckpt["buffer_x_next"][:s])
         self.buffer.pixel[:s].copy_(ckpt["buffer_pixel"][:s])
         self.buffer.d_xy[:s].copy_(ckpt["buffer_d_xy"][:s])
-        self.buffer.delta_d[:s].copy_(ckpt["buffer_delta_d"][:s])
+        self.buffer.velocity[:s].copy_(ckpt["buffer_velocity"][:s])
         self.buffer.r[:s].copy_(ckpt["buffer_r"][:s])
         self.buffer.done[:s].copy_(ckpt["buffer_done"][:s])
 
