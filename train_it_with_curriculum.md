@@ -59,3 +59,29 @@ trainer_task = main(
 ```
 
 One practical note: since `train.py` imports `randomize_object_poses` from the scene setup file, if you edit `scene_setup_articulated_vectorized.py`, rerun the scene setup before starting a new training run.
+
+
+----------------------
+
+Yes, mostly.
+
+Your implementation can continue with different rewards, but the important detail is the replay buffer.
+
+If you change `c_step`, `c_target_separation`, `c_success`, etc., you should continue with **weights-only resume**, not full resume, because full resume keeps old replay transitions with old rewards already stored.
+
+Use this pattern:
+
+1. Save checkpoint from current stage.
+2. Edit `config.yaml`, for example:
+   ```yaml
+   c_step: 0.04
+   max_steps_per_episode: 15
+   ```
+3. Rerun/reload the training script so `rl/rewards.py` reloads the new config.
+4. Resume with `resume_mode="weights"`.
+
+That keeps the learned network weights but clears replay, so the critic starts collecting transitions under the new reward definition.
+
+If you use full resume, it will technically run, but the buffer will contain a mixture of old-reward and new-reward transitions. For curriculum reward changes, that is messy and I would avoid it.
+
+One caveat: your current weights-only resume resets epsilon/noise to `EPS_START` / `SIGMA_START`. That may be okay for a new curriculum stage, but if you want a smoother continuation, we could patch a “weights resume but preserve/set epsilon” option.

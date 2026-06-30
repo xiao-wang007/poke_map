@@ -91,6 +91,10 @@ from rl.rewards import compute_rewards
 from rl.termination import EpisodeTermination
 from rl.replay_buffer import ReplayBuffer
 from rl.prior import heuristic_poke_actions, select_action
+from rl.action_constraints import (
+    constrain_params_target_half_plane_torch,
+    constrain_target_half_plane,
+)
 
 CONFIG = load_config()
 SCENE_CONFIG = CONFIG["scene"]
@@ -135,6 +139,7 @@ STRIKE_DT: float = 1.0 / STRIKE_CONTROL_FREQ
 STRIKE_MAX_DURATION: float = TRAIN_CONFIG["strike_max_duration"]
 STRIKE_MIN_STEPS: int = TRAIN_CONFIG["strike_min_steps"]
 POKE_SETTLE_STEPS: int = TRAIN_CONFIG["poke_settle_steps"]
+TARGET_HALFPLANE_MIN_DOT: float = TRAIN_CONFIG.get("target_halfplane_min_dot", 0.0)
 FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
 POKE_Z: float = OBJECT_HEIGHT * 0.5
 SAFE_Z: float = TRAIN_CONFIG["safe_z"]
@@ -153,6 +158,7 @@ YAW_FULL_RANGE: float = np.pi
 TRAIN_AFTER: int = TRAIN_CONFIG["train_after"]
 TRAIN_EVERY: int = TRAIN_CONFIG["train_every"]
 GRAD_UPDATES_PER_STEP: int = TRAIN_CONFIG["grad_updates_per_step"]
+ACTOR_UPDATE_EVERY: int = TRAIN_CONFIG["actor_update_every"]
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 CHECKPOINT_EVERY: int = TRAIN_CONFIG["checkpoint_every"]
@@ -892,11 +898,13 @@ def train_step(
     optimizer_mu: torch.optim.Optimizer,
     batch: dict[str, torch.Tensor],
     gamma: float = GAMMA,
+    update_actor: bool = True,
 ):
     """One DQN + DPG training step on a minibatch."""
     x       = batch["x"]
     pixel   = batch["pixel"]       # (B, 2)
     d_xy_st = batch["d_xy"]        # (B, 2)  stored (with noise)
+    target_dir_st = batch["target_dir"]  # (B, 2) selected object → target
     v_st    = batch["velocity"]      # (B, 1)  stored velocity (m/s)
     L_st    = batch["strike_length"]  # (B, 1)  executed strike travel (m)
     r       = batch["r"]           # (B, 1)
@@ -910,8 +918,13 @@ def train_step(
     target_net.eval()
 
     #* -- stored action params (with exploration noise, as executed) -----
-    a_stored = clamp_action_velocity_torch(
+    a_stored_raw = constrain_params_target_half_plane_torch(
         torch.cat([d_xy_st, v_st], dim=1),
+        target_dir_st,
+        TARGET_HALFPLANE_MIN_DOT,
+    )
+    a_stored = clamp_action_velocity_torch(
+        a_stored_raw,
         L_st,
     )  # (B, 3)
 
@@ -941,6 +954,9 @@ def train_step(
     torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 10.0)
     optimizer_q.step()
 
+    if not update_actor:
+        return L_Q.item(), 0.0
+
     #* =================================================================
     #*  LOSS 2 — DPG (Deterministic Policy Gradient)
     #* =================================================================
@@ -959,6 +975,13 @@ def train_step(
 
     #* actor params at the stored pixel
     params_actor_at = actor_critic.params_at_pixel(params_act, pixel)  # (B, 3)
+
+    #! Actor / param-head update uses the same constraint
+    params_actor_at = constrain_params_target_half_plane_torch(
+        params_actor_at,
+        target_dir_st,
+        TARGET_HALFPLANE_MIN_DOT,
+    )
     params_actor_at = clamp_action_velocity_torch(params_actor_at, L_st)
 
     #* FiLM from actor params (forward only — film weights frozen, no gradients)
@@ -1022,6 +1045,7 @@ class Trainer:
         self.epsilon = EPS_START
         self.noise_std = SIGMA_START
         self.global_step = 0
+        self.train_update_count = 0
 
         #* metrics
         self.ep_returns: deque[float] = deque(maxlen=100)
@@ -1144,6 +1168,7 @@ class Trainer:
         heuristic_reward_sum = 0.0
         policy_reward_count = 0
         heuristic_reward_count = 0
+        direction_po_count = 0
         stop_reason = "max_steps"
         termination = EpisodeTermination(
             NUM_ENVS, self._targets_pos, self._env_root_pos)
@@ -1168,6 +1193,16 @@ class Trainer:
                 self.epsilon, self.noise_std,
                 heuristic_actions=heuristic_actions,
             )
+            d_xy, target_dirs, dir_po = constrain_target_half_plane(
+                pixel_ij,
+                d_xy,
+                poses_before,
+                self._targets_pos,
+                self._env_root_pos,
+                self.K,
+                active=was_active,
+                min_dot=TARGET_HALFPLANE_MIN_DOT,
+            )
             strike_lengths = compute_adaptive_strike_lengths(
                 pixel_ij,
                 poses_before,
@@ -1188,6 +1223,9 @@ class Trainer:
                 greedy_velocity_samples.append(greedy_velocity[was_active])
                 strike_length_samples.append(strike_lengths[was_active])
                 policy_selected_count += int((is_policy_action & was_active).sum())
+                direction_po_count += int(
+                    (dir_po & was_active).sum()
+                )
             update_action_overlay(
                 pixel_ij, d_xy, delta_d, self.K,
                 active=was_active,
@@ -1234,7 +1272,7 @@ class Trainer:
             for b in range(NUM_ENVS):
                 if was_active[b]:
                     self.buffer.push(
-                        x[b:b+1], pixel_ij[b], d_xy[b],
+                        x[b:b+1], pixel_ij[b], d_xy[b], target_dirs[b],
                         float(delta_d[b]), float(strike_lengths[b]),
                         float(rewards[b]), x_next[b:b+1],
                         termination.replay_done(b, step, early_truncated),
@@ -1252,11 +1290,16 @@ class Trainer:
             #* — training —————————————————————————————————————
             if self.buffer.size >= TRAIN_AFTER and self.global_step % TRAIN_EVERY == 0:
                 for _ in range(GRAD_UPDATES_PER_STEP):
+                    self.train_update_count += 1
+                    update_actor = (
+                        self.train_update_count % max(1, ACTOR_UPDATE_EVERY) == 0
+                    )
                     batch = self.buffer.sample(BATCH_SIZE)
                     lq, lmu = train_step(
                         self.actor_critic, self.target_net,
                         self.optimizer_q, self.optimizer_mu,
                         batch,
+                        update_actor=update_actor,
                     )
                     soft_update(self.target_net, self.actor_critic, TAU)
 
@@ -1283,6 +1326,7 @@ class Trainer:
             policy_reward_count,
             heuristic_reward_sum,
             heuristic_reward_count,
+            direction_po_count,
         )
 
         return ep_return, ep_len
@@ -1308,6 +1352,7 @@ class Trainer:
         policy_reward_count: int,
         heuristic_reward_sum: float,
         heuristic_reward_count: int,
+        direction_po_count: int,
     ) -> dict[str, float]:
         sel_mean, sel_max = self._mean_max(selected_samples)
         contact_mean, contact_max = self._mean_max(contact_samples)
@@ -1325,6 +1370,7 @@ class Trainer:
             "policy_frac": policy_selected_count / max(1, active_steps),
             "policy_reward": policy_reward_sum / max(1, policy_reward_count),
             "heuristic_reward": heuristic_reward_sum / max(1, heuristic_reward_count),
+            "direction_po_frac": direction_po_count / max(1, active_steps),
         }
 
     def log(self, episode: int, ep_return: float, ep_len: int, elapsed: float):
@@ -1354,6 +1400,7 @@ class Trainer:
                 f"  policy={100.0 * velocity_stats['policy_frac']:.1f}%"
                 f"  r_pol={velocity_stats['policy_reward']:.4f}"
                 f"  r_heur={velocity_stats['heuristic_reward']:.4f}"
+                f"  dir_po={100.0 * velocity_stats['direction_po_frac']:.1f}%"
             )
         print(
             f"[ep {episode:5d}] "
@@ -1377,6 +1424,7 @@ class Trainer:
             "optimizer_q":  self.optimizer_q.state_dict(),
             "optimizer_mu": self.optimizer_mu.state_dict(),
             "global_step":  self.global_step,
+            "train_update_count": self.train_update_count,
             "epsilon":      self.epsilon,
             "noise_std":    self.noise_std,
             "episode":      episode,
@@ -1389,6 +1437,7 @@ class Trainer:
             "buffer_x_next":  self.buffer.x_next[:self.buffer.size],
             "buffer_pixel":   self.buffer.pixel[:self.buffer.size],
             "buffer_d_xy":    self.buffer.d_xy[:self.buffer.size],
+            "buffer_target_dir": self.buffer.target_dir[:self.buffer.size],
             "buffer_velocity": self.buffer.velocity[:self.buffer.size],
             "buffer_strike_length": self.buffer.strike_length[:self.buffer.size],
             "buffer_r":       self.buffer.r[:self.buffer.size],
@@ -1410,6 +1459,7 @@ class Trainer:
         self.optimizer_q.load_state_dict(ckpt["optimizer_q"])
         self.optimizer_mu.load_state_dict(ckpt["optimizer_mu"])
         self.global_step = ckpt["global_step"]
+        self.train_update_count = ckpt.get("train_update_count", 0)
         self.epsilon     = ckpt["epsilon"]
         self.noise_std   = ckpt["noise_std"]
         self.rng.bit_generator.state = ckpt["rng_state"]
@@ -1430,6 +1480,10 @@ class Trainer:
         self.buffer.x_next[:s].copy_(ckpt["buffer_x_next"][:s])
         self.buffer.pixel[:s].copy_(ckpt["buffer_pixel"][:s])
         self.buffer.d_xy[:s].copy_(ckpt["buffer_d_xy"][:s])
+        if "buffer_target_dir" in ckpt:
+            self.buffer.target_dir[:s].copy_(ckpt["buffer_target_dir"][:s])
+        else:
+            self.buffer.target_dir[:s].zero_()
         self.buffer.velocity[:s].copy_(ckpt["buffer_velocity"][:s])
         if "buffer_strike_length" in ckpt:
             self.buffer.strike_length[:s].copy_(ckpt["buffer_strike_length"][:s])
@@ -1456,6 +1510,7 @@ class Trainer:
             self.optimizer_mu.load_state_dict(ckpt["optimizer_mu"])
         self.buffer = ReplayBuffer()
         self.global_step = 0
+        self.train_update_count = 0
         self.epsilon = EPS_START
         self.noise_std = SIGMA_START
         self.ep_returns.clear()

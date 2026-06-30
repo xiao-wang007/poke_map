@@ -25,6 +25,7 @@ class ReplayBuffer:
         self.x = torch.zeros(capacity, 2, height, width, dtype=torch.uint8)
         self.pixel = torch.zeros(capacity, 2, dtype=torch.long)
         self.d_xy = torch.zeros(capacity, 2)
+        self.target_dir = torch.zeros(capacity, 2)
         self.velocity = torch.zeros(capacity, 1)
         self.strike_length = torch.zeros(capacity, 1)
         self.r = torch.zeros(capacity, 1)
@@ -39,6 +40,7 @@ class ReplayBuffer:
         x: torch.Tensor,
         pixel_ij: np.ndarray,
         d_xy: np.ndarray,
+        target_dir: np.ndarray,
         velocity: float,
         strike_length: float,
         reward: float,
@@ -53,6 +55,7 @@ class ReplayBuffer:
             x_uint8.cpu() if x_uint8.device.type != "cpu" else x_uint8)
         self.pixel[idx] = torch.tensor(pixel_ij)
         self.d_xy[idx] = torch.tensor(d_xy)
+        self.target_dir[idx] = torch.tensor(target_dir)
         self.velocity[idx] = torch.tensor([velocity])
         self.strike_length[idx] = torch.tensor([strike_length])
         self.r[idx] = torch.tensor([reward])
@@ -74,6 +77,7 @@ class ReplayBuffer:
             "x": x,
             "pixel": self.pixel[indices].to(self.device),
             "d_xy": self.d_xy[indices].to(self.device),
+            "target_dir": self.target_dir[indices].to(self.device),
             "velocity": self.velocity[indices].to(self.device),
             "strike_length": self.strike_length[indices].to(self.device),
             "r": self.r[indices].to(self.device),
