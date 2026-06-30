@@ -868,6 +868,7 @@ def select_action(
                 velocity_arr[b] = 0.0           # no-op poke (empty contour)
                 continue
 
+            #! heuristic branch
             if np.random.random() < epsilon:
                 if heuristic_actions is not None:
                     h_pixel, h_dxy, h_delta = heuristic_actions
