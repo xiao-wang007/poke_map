@@ -549,7 +549,8 @@ def update_action_overlay(pixel_ij: np.ndarray,
                           delta_d: np.ndarray,
                           K: np.ndarray,
                           active: np.ndarray | None = None,
-                          strike_lengths: np.ndarray | None = None):
+                          strike_lengths: np.ndarray | None = None,
+                          is_policy_action: np.ndarray | None = None):
     """Draw the selected side-poke action for each env."""
     if not SHOW_ACTION_OVERLAY or not _HAS_ISAAC:
         return
@@ -587,6 +588,11 @@ def update_action_overlay(pixel_ij: np.ndarray,
         contact_xy = world_xy - dirs[env_idx] * FINGERTIP_RADIUS   # sphere touches surface
         strike_xy = world_xy + dirs[env_idx] * (l_env / 2.0)
 
+        path_color = (
+            (0.95, 0.35, 1.0)
+            if is_policy_action is not None and bool(is_policy_action[env_idx])
+            else (1.0, 0.85, 0.0)
+        )
         points = {
             "Standoff": (standoff_xy, (0.0, 0.25, 1.0)),
             "Contact": (world_xy, (1.0, 0.0, 0.0)),
@@ -603,7 +609,7 @@ def update_action_overlay(pixel_ij: np.ndarray,
             line_center = 0.5 * (standoff_xy + strike_xy)
             line_yaw = float(np.arctan2(line_vec[1], line_vec[0]))
             line_path = f"{overlay_root}/Path"
-            _define_colored_cube(stage, line_path, (0.0, 1.0, 1.0))
+            _define_colored_cube(stage, line_path, path_color)
             _set_local_transform(
                 line_path,
                 [line_center[0], line_center[1], z],
@@ -1186,6 +1192,7 @@ class Trainer:
                 pixel_ij, d_xy, delta_d, self.K,
                 active=was_active,
                 strike_lengths=strike_lengths,
+                is_policy_action=is_policy_action,
             )
 
             #* — execute (only active envs move; inactive held frozen) —
