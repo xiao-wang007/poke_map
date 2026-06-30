@@ -82,6 +82,7 @@ training:
   c_step: 0.02
   c_success: 10.0
   c_oob: -5.0
+  c_target_separation: 0.05
   success_threshold: 0.02
   stop_poke_threshold: 0.035
 

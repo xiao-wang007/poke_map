@@ -73,8 +73,6 @@ from vision.camera import (
     get_camera_intrinsics,
     get_object_poses_vectorized,
     build_vision_observation,
-    get_object_masks_2d,
-    mask_to_contour,
     pixel_to_world,
 )
 from nn.networks import SpatialActorCritic
@@ -89,6 +87,10 @@ from env.quintic_poly import (
     quintic_poly_second_derivative,
     compute_strike_params,
 )
+from rl.rewards import compute_rewards
+from rl.termination import EpisodeTermination
+from rl.replay_buffer import ReplayBuffer
+from rl.prior import heuristic_poke_actions, select_action
 
 CONFIG = load_config()
 SCENE_CONFIG = CONFIG["scene"]
@@ -123,14 +125,7 @@ SIGMA_START: float = TRAIN_CONFIG["sigma_start"]
 SIGMA_END: float = TRAIN_CONFIG["sigma_end"]
 TAU: float = TRAIN_CONFIG["tau"]
 MAX_STEPS: int = TRAIN_CONFIG["max_steps_per_episode"]
-MIN_ACTIVE_ENVS: int = TRAIN_CONFIG["min_active_envs"]
-C_STEP: float = TRAIN_CONFIG["c_step"]
-C_SUCCESS: float = TRAIN_CONFIG["c_success"]
-C_OOB: float = TRAIN_CONFIG["c_oob"]
-SUCCESS_THRESHOLD: float = TRAIN_CONFIG["success_threshold"]
-STOP_POKE_THRESHOLD: float = TRAIN_CONFIG["stop_poke_threshold"]
 VELOCITY_MAX: float = TRAIN_CONFIG["velocity_max"]
-HEURISTIC_VELOCITY_RANGE: tuple[float, float] = tuple(TRAIN_CONFIG["heuristic_velocity_range"])
 SPEED_XY: float = TRAIN_CONFIG["reposition_speed_xy"]
 SPEED_Z: float = TRAIN_CONFIG["reposition_speed_z"]
 L_STRIKE: float = TRAIN_CONFIG["l_strike"]
@@ -151,7 +146,6 @@ YAW_TARGET_MODE: str = TRAIN_CONFIG["yaw_target_mode"]
 C_YAW: float = TRAIN_CONFIG["c_yaw"]
 YAW_REWARD_ENABLED: bool = TRAIN_CONFIG["yaw_reward_enabled"]
 YAW_SUCCESS_ENABLED: bool = TRAIN_CONFIG["yaw_success_enabled"]
-YAW_THRESHOLD: float = np.deg2rad(TRAIN_CONFIG["yaw_threshold_deg"])
 YAW_CURRICULUM_START: int = TRAIN_CONFIG["yaw_curriculum_start_ep"]
 YAW_CURRICULUM_END: int = TRAIN_CONFIG["yaw_curriculum_end_ep"]
 YAW_FULL_RANGE: float = np.pi
@@ -172,82 +166,6 @@ TARGET_OVERLAY_THICKNESS: float = TRAIN_CONFIG["target_overlay_thickness"]
 TARGET_OVERLAY_OPACITY: float = TRAIN_CONFIG["target_overlay_opacity"]
 SHOW_ACTION_OVERLAY: bool = TRAIN_CONFIG["show_action_overlay"]
 ACTION_OVERLAY_Z_OFFSET: float = TRAIN_CONFIG["action_overlay_z_offset"]
-
-
-#* ================================================================
-#*  Replay buffer
-#* ================================================================
-
-class ReplayBuffer:
-    """Ring buffer storing per-transition data (one env, one step).
-
-    Each element is a flat dict so we can mix across envs and episodes.
-    x / x_next are stored as uint8 (binary contours) to save memory.
-    Mask is reconstructed on-the-fly from x in sample() / train_step().
-    """
-
-    def __init__(self, capacity: int = BUFFER_CAPACITY, device: str = DEVICE):
-        self.capacity = capacity
-        self.device = device
-
-        H, W = RESOLUTION
-        self.x        = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
-        self.pixel    = torch.zeros(capacity, 2, dtype=torch.long)
-        self.d_xy     = torch.zeros(capacity, 2)
-        self.velocity = torch.zeros(capacity, 1)
-        self.strike_length = torch.zeros(capacity, 1)
-        self.r        = torch.zeros(capacity, 1)
-        self.x_next   = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
-        self.done     = torch.zeros(capacity, 1, dtype=torch.bool)
-
-        self.ptr = 0
-        self.size = 0
-
-    def push(
-        self,
-        x: torch.Tensor,             # (1, 2, H, W) float32 binary contours
-        pixel_ij: np.ndarray,        # (2,) int
-        d_xy: np.ndarray,            # (2,)
-        velocity: float,
-        strike_length: float,
-        reward: float,
-        x_next: torch.Tensor,        # (1, 2, H, W) float32
-        done: bool,
-    ):
-        idx = self.ptr
-        # float32 → uint8 (binary 0/1 contours)
-        _x = (x.squeeze(0) * 255).to(torch.uint8)
-        _xn = (x_next.squeeze(0) * 255).to(torch.uint8)
-        self.x[idx].copy_(_x.cpu() if _x.device.type != "cpu" else _x)
-        self.pixel[idx] = torch.tensor(pixel_ij)
-        self.d_xy[idx] = torch.tensor(d_xy)
-        self.velocity[idx] = torch.tensor([velocity])
-        self.strike_length[idx] = torch.tensor([strike_length])
-        self.r[idx] = torch.tensor([reward])
-        self.x_next[idx].copy_(_xn.cpu() if _xn.device.type != "cpu" else _xn)
-        self.done[idx] = torch.tensor([done])
-
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
-        indices = torch.randint(0, self.size, (batch_size,))
-        x      = self.x[indices].to(torch.float32).to(self.device) / 255.0
-        x_next = self.x_next[indices].to(torch.float32).to(self.device) / 255.0
-        return {
-            "x":         x,
-            "pixel":     self.pixel[indices].to(self.device),
-            "d_xy":      self.d_xy[indices].to(self.device),
-            "velocity":  self.velocity[indices].to(self.device),
-            "strike_length": self.strike_length[indices].to(self.device),
-            "r":         self.r[indices].to(self.device),
-            "x_next":    x_next,
-            "done":      self.done[indices].to(self.device),
-            "mask_next": x_next[:, 0] > 0,          # derived from channel 0
-        }
-
-    def __len__(self) -> int:
-        return self.size
 
 
 #* ================================================================
@@ -694,213 +612,6 @@ def update_action_overlay(pixel_ij: np.ndarray,
             )
 
 
-#* ================================================================
-#*  Action selection
-#* ================================================================
-
-def _mask_center(mask: torch.Tensor) -> np.ndarray | None:
-    pixels = torch.nonzero(mask, as_tuple=False)
-    if pixels.numel() == 0:
-        return None
-    return pixels.to(torch.float32).mean(dim=0).cpu().numpy()
-
-
-def _pixels_to_local_xy(pixel_ij: np.ndarray, K: np.ndarray) -> np.ndarray:
-    pixels = np.asarray(pixel_ij, dtype=np.float32)
-    rows = pixels[:, 0]
-    cols = pixels[:, 1]
-    x = (cols - K[0, 2]) / K[0, 0]
-    y = (rows - K[1, 2]) / K[1, 1]
-    return np.stack([x, y], axis=1).astype(np.float32)
-
-
-def _normalise_xy(v: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
-    norm = float(np.linalg.norm(v))
-    if norm < 1e-8:
-        if fallback is not None:
-            return fallback.astype(np.float32)
-        angle = np.random.uniform(-np.pi, np.pi)
-        return np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
-    return (v / norm).astype(np.float32)
-
-
-def sample_heuristic_velocity() -> np.float32:
-    low, high = HEURISTIC_VELOCITY_RANGE
-    low = max(0.0, float(low))
-    high = min(float(high), VELOCITY_MAX)
-    if high < low:
-        high = low
-    return np.float32(np.random.uniform(low, high))
-
-
-def heuristic_poke_actions(
-    contour_masks: torch.Tensor,
-    poses_before: dict,
-    targets_pos: dict[str, np.ndarray],
-    env_root_pos: np.ndarray,
-    K: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Physically plausible exploration pokes for epsilon actions.
-
-    Pick the object that is farther from its target, choose a contour pixel on
-    the backside relative to target displacement, and push toward the target.
-    """
-    B = contour_masks.shape[0]
-    pixel_ij = np.zeros((B, 2), dtype=np.int32)
-    d_xy = np.zeros((B, 2), dtype=np.float32)
-    delta_d = np.full(B, HEURISTIC_VELOCITY_RANGE[0], dtype=np.float32)
-
-    masks_cpu = contour_masks.detach().cpu()
-    env_offsets = env_root_pos[:, :2]
-
-    for b in range(B):
-        valid_pixels_t = torch.nonzero(masks_cpu[b], as_tuple=False)
-        if valid_pixels_t.numel() == 0:
-            continue
-
-        object_infos = []
-        for obj_name, target in targets_pos.items():
-            current_xy = poses_before[obj_name][0][b, :2] - env_offsets[b]
-            target_xy = target[b, :2]
-            to_target = target_xy - current_xy
-            dist = float(np.linalg.norm(to_target))
-            object_infos.append((dist, obj_name, current_xy, target_xy, to_target))
-
-        movable_infos = [info for info in object_infos if info[0] >= STOP_POKE_THRESHOLD]
-        if not movable_infos:
-            movable_infos = object_infos
-        _, obj_name, current_xy, _, to_target = max(movable_infos, key=lambda item: item[0])
-        goal_dir = _normalise_xy(to_target)
-
-        local_position = poses_before[obj_name][0][b:b + 1].copy()
-        local_position[:, :2] -= env_offsets[b]
-        object_mask = get_object_masks_2d(
-            object_name=obj_name,
-            object_positions=local_position,
-            object_orientations=poses_before[obj_name][1][b:b + 1],
-            K=K,
-            resolution=RESOLUTION,
-        )[0]
-        object_contour, _ = mask_to_contour(object_mask)
-        valid_pixels = np.argwhere(object_contour).astype(np.int32)
-        if valid_pixels.shape[0] == 0:
-            valid_pixels = valid_pixels_t.numpy().astype(np.int32)
-        contact_xys = _pixels_to_local_xy(valid_pixels, K)
-
-        if obj_name == "Cylinder":
-            desired_contact_xy = current_xy - goal_dir * CYLINDER_RADIUS
-            nearest = int(np.argmin(np.linalg.norm(contact_xys - desired_contact_xy[None, :], axis=1)))
-            pixel_ij[b] = valid_pixels[nearest]
-            noisy_dir = goal_dir + np.random.randn(2).astype(np.float32) * 0.05
-            d_xy[b] = _normalise_xy(noisy_dir, fallback=goal_dir)
-            delta_d[b] = sample_heuristic_velocity()
-            continue
-
-        inward_scores = (current_xy[None, :] - contact_xys) @ goal_dir
-        candidate_mask = inward_scores > 0.0
-        candidate_pixels = valid_pixels[candidate_mask]
-        candidate_xys = contact_xys[candidate_mask]
-
-        if candidate_pixels.shape[0] == 0:
-            candidate_pixels = valid_pixels
-            candidate_xys = contact_xys
-
-        backside_scores = (candidate_xys - current_xy[None, :]) @ (-goal_dir)
-        k = min(25, candidate_pixels.shape[0])
-        top_idx = np.argpartition(backside_scores, -k)[-k:]
-        chosen = int(np.random.choice(top_idx))
-
-        pixel_ij[b] = candidate_pixels[chosen]
-        noisy_dir = goal_dir + np.random.randn(2).astype(np.float32) * 0.10
-        d_xy[b] = _normalise_xy(noisy_dir, fallback=goal_dir)
-        delta_d[b] = sample_heuristic_velocity()
-
-    return pixel_ij, d_xy, delta_d
-
-
-def select_action(
-    actor_critic: SpatialActorCritic,
-    x: torch.Tensor,                       # (B, 2, H, W)
-    contour_masks: torch.Tensor,           # (B, H, W) bool
-    epsilon: float,
-    noise_std: float,
-    heuristic_actions: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-    top_k: int = 5,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Select actions for a batch of observations.
-
-    Greedy envs use per-pixel FiLM-conditioned pixel selection (top-K
-    re-evaluation).  ε-greedy envs use the provided heuristic action prior
-    when available, so early exploration produces meaningful pushes instead
-    of untrained param-head thrashing.
-
-    Returns
-    -------
-    pixel_ij : (B, 2) int   — (row, col) per env
-    d_xy     : (B, 2) float — normalised unit vector
-    delta_d  : (B,)  float — poke velocity in [0, VELOCITY_MAX]
-    is_policy: (B,)  bool  — True when selected by greedy policy branch
-    greedy_v : (B,)  float — policy velocity at greedy pixel before noise
-    """
-    B = x.shape[0]
-    device = x.device
-    actor_critic.eval()
-
-    pixel_ij = np.zeros((B, 2), dtype=np.int32)
-    d_xy_arr = np.zeros((B, 2), dtype=np.float32)
-    velocity_arr = np.zeros(B, dtype=np.float32)
-    is_policy = np.zeros(B, dtype=bool)
-    greedy_velocity_arr = np.zeros(B, dtype=np.float32)
-
-    with torch.no_grad():
-        # one U-Net pass — features + per-pixel params
-        f, params, _ = actor_critic.features_and_params(x)
-
-        # batched greedy pixel selection (per-pixel FiLM conditioned)
-        greedy_pix, _ = actor_critic.greedy_pixel(f, params, contour_masks, top_k=top_k)
-        batch_idx = torch.arange(B, device=device)
-        greedy_velocity_arr = (
-            params[batch_idx, 2, greedy_pix[:, 0], greedy_pix[:, 1]]
-            .detach().cpu().numpy().astype(np.float32)
-        )
-
-        for b in range(B):
-            if contour_masks[b].sum() == 0:
-                velocity_arr[b] = 0.0           # no-op poke (empty contour)
-                continue
-
-            #! heuristic branch
-            if np.random.random() < epsilon:
-                if heuristic_actions is not None:
-                    h_pixel, h_dxy, h_delta = heuristic_actions
-                    pixel_ij[b] = h_pixel[b]
-                    d_noisy = h_dxy[b]
-                    dd_noisy = h_delta[b]
-                else:
-                    valid = torch.nonzero(contour_masks[b], as_tuple=True)
-                    r = np.random.randint(len(valid[0]))
-                    pixel_ij[b, 0] = valid[0][r].item()
-                    pixel_ij[b, 1] = valid[1][r].item()
-                    d_noisy = np.random.randn(2).astype(np.float32)
-                    dd_noisy = sample_heuristic_velocity()
-            else:
-                # greedy: pre-computed per-pixel-conditioned best pixel
-                pixel_ij[b, 0] = greedy_pix[b, 0].item()
-                pixel_ij[b, 1] = greedy_pix[b, 1].item()
-                # read params at selected pixel
-                p = params[b, :, pixel_ij[b, 0], pixel_ij[b, 1]].cpu().numpy()  # (3,)
-                d_noisy = p[:2] + np.random.randn(2).astype(np.float32) * noise_std
-                dd_noisy = p[2] + abs(np.float32(np.random.randn())) * noise_std
-                is_policy[b] = True
-
-            # clamp & normalise direction
-            norm = np.linalg.norm(d_noisy) + 1e-8
-            d_xy_arr[b] = d_noisy / norm
-            velocity_arr[b] = np.clip(dd_noisy, 0.0, actor_critic.velocity_max)
-
-    return pixel_ij, d_xy_arr, velocity_arr, is_policy, greedy_velocity_arr
-
-
 def contact_velocity_from_command(
     v_mid: np.ndarray,
     strike_lengths: np.ndarray | None = None,
@@ -920,18 +631,6 @@ def contact_velocity_from_command(
         out[idx] = (lengths[idx] / T) * quintic_poly_derivative(0.5)
     return out
 
-
-
-#* ================================================================
-#*  Reward & termination
-#* ================================================================
-
-def _yaw_error(quats: np.ndarray, target_quats: np.ndarray) -> np.ndarray:
-    """Wrapped angle difference between quaternion yaws (radians, [0, π])."""
-    yaw = 2.0 * np.arctan2(quats[:, 3], quats[:, 0])
-    t_yaw = 2.0 * np.arctan2(target_quats[:, 3], target_quats[:, 0])
-    diff = yaw - t_yaw
-    return np.abs(np.arctan2(np.sin(diff), np.cos(diff)))
 
 
 def _yaws_to_quats(yaws: np.ndarray) -> np.ndarray:
@@ -958,97 +657,6 @@ def yaw_target_half_range(episode: int) -> float:
         f"Unknown YAW_TARGET_MODE={YAW_TARGET_MODE!r}; "
         "use 'preserve', 'curriculum', or 'fixed'."
     )
-
-
-def compute_rewards(
-    poses_before: dict,         # obj_name → (positions, quaternions) in world coords
-    poses_after: dict,
-    targets: dict,              # obj_name → (N_envs, 3)  in env-local coords
-    env_root_pos: np.ndarray | None = None,  # (N_envs, 3)
-    done_once: np.ndarray | None = None,     # (N_envs,) bool
-    target_oris: dict | None = None,         # obj_name → (N_envs, 4) quat targets
-    yaw_reward_enabled: bool = YAW_REWARD_ENABLED,
-    yaw_success_enabled: bool = YAW_SUCCESS_ENABLED,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-env reward + done flag.
-
-    Progress reward: signed distance + signed yaw reduction.
-    C_SUCCESS awarded only the first time an env achieves the threshold.
-    """
-    num_envs = list(poses_before.values())[0][0].shape[0]
-    r = np.zeros(num_envs, dtype=np.float32)
-    done = np.ones(num_envs, dtype=bool)
-    if done_once is None:
-        done_once = np.zeros(num_envs, dtype=bool)
-
-    offset = env_root_pos[:, :2] if env_root_pos is not None else np.zeros((num_envs, 2))
-
-    for obj_name in poses_before:
-        pos_before = poses_before[obj_name][0].copy()
-        pos_after  = poses_after[obj_name][0].copy()
-        pos_before[:, :2] -= offset
-        pos_after[:, :2]  -= offset
-        d_before = np.linalg.norm(pos_before[:, :2] - targets[obj_name][:, :2], axis=1)
-        d_after  = np.linalg.norm(pos_after[:, :2] - targets[obj_name][:, :2], axis=1)
-        r += d_before - d_after
-        done &= (d_after < SUCCESS_THRESHOLD)
-
-        if obj_name == "LObject" and target_oris is not None and obj_name in target_oris:
-            y_err_before = _yaw_error(poses_before[obj_name][1], target_oris[obj_name])
-            y_err_after  = _yaw_error(poses_after[obj_name][1], target_oris[obj_name])
-            if yaw_reward_enabled:
-                r += C_YAW * (y_err_before - y_err_after)
-            if yaw_success_enabled:
-                done &= (y_err_after < YAW_THRESHOLD)
-
-    r -= C_STEP
-
-    # OOB termination: if any object leaves the workspace, terminate with penalty
-    oob_after = ~objects_in_workspace(poses_after, env_root_pos)
-    r[oob_after] += C_OOB
-    done |= oob_after
-
-    first_done = done & ~done_once
-    r[first_done] += C_SUCCESS
-    done_once = done_once | done
-
-    return r, done, done_once
-
-
-def objects_in_workspace(
-    poses: dict,
-    env_root_pos: np.ndarray,
-    wx_min: float = float(WORKSPACE_CONFIG["x_min"]),
-    wx_max: float = float(WORKSPACE_CONFIG["x_max"]),
-    wy_min: float = float(WORKSPACE_CONFIG["y_min"]),
-    wy_max: float = float(WORKSPACE_CONFIG["y_max"]),
-) -> np.ndarray:
-    """Return bool array: True where ALL object CoMs are inside workspace."""
-    num_envs = list(poses.values())[0][0].shape[0]
-    inside = np.ones(num_envs, dtype=bool)
-    offset = env_root_pos[:, :2]
-    for obj_name, (positions, _) in poses.items():
-        local_xy = positions[:, :2].copy() - offset
-        inside &= (local_xy[:, 0] >= wx_min) & (local_xy[:, 0] <= wx_max)
-        inside &= (local_xy[:, 1] >= wy_min) & (local_xy[:, 1] <= wy_max)
-    return inside
-
-
-def near_translation_targets(
-    poses: dict,
-    targets: dict,
-    env_root_pos: np.ndarray,
-    threshold: float = STOP_POKE_THRESHOLD,
-) -> np.ndarray:
-    """Return envs where all object centers are close enough to targets."""
-    num_envs = list(poses.values())[0][0].shape[0]
-    near = np.ones(num_envs, dtype=bool)
-    offset = env_root_pos[:, :2]
-    for obj_name, (positions, _) in poses.items():
-        local_xy = positions[:, :2].copy() - offset
-        dist = np.linalg.norm(local_xy - targets[obj_name][:, :2], axis=1)
-        near &= dist < threshold
-    return near
 
 
 #* ================================================================
@@ -1509,7 +1117,6 @@ class Trainer:
         self._targets_pos = targets_pos
         self._targets_ori = targets_ori
         self._env_root_pos = env_root_pos
-        self._done_once = np.zeros(NUM_ENVS, dtype=bool)
 
         return x.to(DEVICE), contour_masks.to(DEVICE), poses_before
 
@@ -1528,17 +1135,13 @@ class Trainer:
         strike_length_samples = []
         policy_selected_count = 0
         stop_reason = "max_steps"
+        termination = EpisodeTermination(
+            NUM_ENVS, self._targets_pos, self._env_root_pos)
 
         for step in range(MAX_STEPS):
-            has_contour = contour_masks.any(dim=(-2, -1)).cpu().numpy()
+            was_active, has_contour = termination.begin_step(
+                poses_before, contour_masks)
             final_has_contour = has_contour
-            near_target = near_translation_targets(
-                poses_before, self._targets_pos, self._env_root_pos
-            )
-            oob_before = ~objects_in_workspace(poses_before, self._env_root_pos)
-            self._done_once |= near_target
-            self._done_once |= oob_before
-            was_active = ~self._done_once & has_contour  # done OR invisible OR oob → frozen
             active_counts.append(int(was_active.sum()))
             ep_active_steps += int(was_active.sum())
 
@@ -1590,14 +1193,11 @@ class Trainer:
             )
             rewards, dones, self._done_once = compute_rewards(
                 poses_before, poses_after,
-                self._targets_pos, self._env_root_pos, self._done_once,
+                self._targets_pos, self._env_root_pos, termination.done_once,
                 target_oris=self._targets_ori,
                 yaw_reward_enabled=YAW_REWARD_ENABLED,
                 yaw_success_enabled=YAW_SUCCESS_ENABLED)
-            self._done_once |= near_translation_targets(
-                poses_after, self._targets_pos, self._env_root_pos
-            )
-            self._done_once |= ~objects_in_workspace(poses_after, self._env_root_pos)
+            termination.apply_reward_done(self._done_once)
             rewards[~was_active] = 0.0
 
             #* — observe next state ——————————————————————————
@@ -1606,23 +1206,19 @@ class Trainer:
                 env_root_pos=self._env_root_pos,
             )
             contour_masks_next = x_next[:, 0] > 0  # match network observation exactly
-            remaining_active_next = int(
-                (~self._done_once & contour_masks_next.cpu().numpy().any(axis=(-2, -1))).sum()
+            final_has_contour, remaining_active_next, early_truncated = (
+                termination.finish_step(poses_after, contour_masks_next)
             )
-            early_truncated = (
-                not self._done_once.all()
-                and remaining_active_next <= MIN_ACTIVE_ENVS
-            )
+            self._done_once = termination.done_once
 
             #* — store transitions for envs active at step start ——————
-            truncated = (step == MAX_STEPS - 1) or early_truncated
             for b in range(NUM_ENVS):
                 if was_active[b]:
                     self.buffer.push(
                         x[b:b+1], pixel_ij[b], d_xy[b],
                         float(delta_d[b]), float(strike_lengths[b]),
                         float(rewards[b]), x_next[b:b+1],
-                        bool(self._done_once[b] or truncated),
+                        termination.replay_done(b, step, early_truncated),
                     )
 
             ep_return += rewards[was_active].sum()
@@ -1645,12 +1241,9 @@ class Trainer:
                     )
                     soft_update(self.target_net, self.actor_critic, TAU)
 
-            if self._done_once.all():
-                stop_reason = "all_done"
-                break
-
-            if early_truncated:
-                stop_reason = "min_active"
+            next_stop_reason = termination.stop_reason(early_truncated)
+            if next_stop_reason is not None:
+                stop_reason = next_stop_reason
                 break
 
         self.ep_returns.append(ep_return)
