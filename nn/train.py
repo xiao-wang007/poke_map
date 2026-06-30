@@ -139,6 +139,7 @@ STRIKE_CONTROL_FREQ: int = TRAIN_CONFIG["strike_control_freq"]
 STRIKE_DT: float = 1.0 / STRIKE_CONTROL_FREQ
 STRIKE_MAX_DURATION: float = TRAIN_CONFIG["strike_max_duration"]
 STRIKE_MIN_STEPS: int = TRAIN_CONFIG["strike_min_steps"]
+POKE_SETTLE_STEPS: int = TRAIN_CONFIG["poke_settle_steps"]
 FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
 POKE_Z: float = OBJECT_HEIGHT * 0.5
 SAFE_Z: float = TRAIN_CONFIG["safe_z"]
@@ -1252,11 +1253,10 @@ async def env_step_async(
     await _constant_velocity_phase(q4, SPEED_Z)
 
     #* ── Phase 5: settle briefly, then clear residual object velocities ─
-    SETTLE_STEPS = 30
     l_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/LObject")
     cyl_objects = RigidPrim(paths=f"{ENVS_ROOT_PATH}/env_.*/Cylinder")
 
-    await _step_physics(SETTLE_STEPS)
+    await _step_physics(POKE_SETTLE_STEPS)
     zero_vel = np.zeros((B, 3), dtype=np.float32)
     l_objects.set_velocities(linear_velocities=zero_vel, angular_velocities=zero_vel)
     cyl_objects.set_velocities(linear_velocities=zero_vel, angular_velocities=zero_vel)

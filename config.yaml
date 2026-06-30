@@ -87,14 +87,15 @@ training:
 
   velocity_max: 1.5
   heuristic_velocity_range: [0.3, 1.0]
-  reposition_speed_xy: 0.6    # m/s — constant velocity for XY travel between standoffs
-  reposition_speed_z: 0.15     # m/s — constant velocity for Z lift/drop
+  reposition_speed_xy: 1.5    # m/s — constant velocity for XY travel between standoffs
+  reposition_speed_z: 0.6     # m/s — constant velocity for Z lift/drop
   safe_z: 0.1                  # m — safe lift height for repositioning
   l_strike: 0.15               # m — total strike travel distance (0.5L behind → 0.5L ahead)
   l_strike_min: 0.05           # m — shortest adaptive strike travel near targets
   strike_control_freq: 60     # Hz — trajectory control frequency
   strike_max_duration: 2.0    # s  — clamp upper bound on strike duration
   strike_min_steps: 3         # minimum trajectory steps
+  poke_settle_steps: 5       # physics steps to settle objects after each poke
 
   yaw_target_mode: preserve
   c_yaw: 0.1
