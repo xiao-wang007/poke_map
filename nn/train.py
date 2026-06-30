@@ -123,12 +123,14 @@ SIGMA_START: float = TRAIN_CONFIG["sigma_start"]
 SIGMA_END: float = TRAIN_CONFIG["sigma_end"]
 TAU: float = TRAIN_CONFIG["tau"]
 MAX_STEPS: int = TRAIN_CONFIG["max_steps_per_episode"]
+MIN_ACTIVE_ENVS: int = TRAIN_CONFIG["min_active_envs"]
 C_STEP: float = TRAIN_CONFIG["c_step"]
 C_SUCCESS: float = TRAIN_CONFIG["c_success"]
 C_OOB: float = TRAIN_CONFIG["c_oob"]
 SUCCESS_THRESHOLD: float = TRAIN_CONFIG["success_threshold"]
 STOP_POKE_THRESHOLD: float = TRAIN_CONFIG["stop_poke_threshold"]
 VELOCITY_MAX: float = TRAIN_CONFIG["velocity_max"]
+HEURISTIC_VELOCITY_RANGE: tuple[float, float] = tuple(TRAIN_CONFIG["heuristic_velocity_range"])
 SPEED_XY: float = TRAIN_CONFIG["reposition_speed_xy"]
 SPEED_Z: float = TRAIN_CONFIG["reposition_speed_z"]
 L_STRIKE: float = TRAIN_CONFIG["l_strike"]
@@ -192,6 +194,7 @@ class ReplayBuffer:
         self.pixel    = torch.zeros(capacity, 2, dtype=torch.long)
         self.d_xy     = torch.zeros(capacity, 2)
         self.velocity = torch.zeros(capacity, 1)
+        self.strike_length = torch.zeros(capacity, 1)
         self.r        = torch.zeros(capacity, 1)
         self.x_next   = torch.zeros(capacity, 2, H, W, dtype=torch.uint8)
         self.done     = torch.zeros(capacity, 1, dtype=torch.bool)
@@ -205,6 +208,7 @@ class ReplayBuffer:
         pixel_ij: np.ndarray,        # (2,) int
         d_xy: np.ndarray,            # (2,)
         velocity: float,
+        strike_length: float,
         reward: float,
         x_next: torch.Tensor,        # (1, 2, H, W) float32
         done: bool,
@@ -217,6 +221,7 @@ class ReplayBuffer:
         self.pixel[idx] = torch.tensor(pixel_ij)
         self.d_xy[idx] = torch.tensor(d_xy)
         self.velocity[idx] = torch.tensor([velocity])
+        self.strike_length[idx] = torch.tensor([strike_length])
         self.r[idx] = torch.tensor([reward])
         self.x_next[idx].copy_(_xn.cpu() if _xn.device.type != "cpu" else _xn)
         self.done[idx] = torch.tensor([done])
@@ -233,6 +238,7 @@ class ReplayBuffer:
             "pixel":     self.pixel[indices].to(self.device),
             "d_xy":      self.d_xy[indices].to(self.device),
             "velocity":  self.velocity[indices].to(self.device),
+            "strike_length": self.strike_length[indices].to(self.device),
             "r":         self.r[indices].to(self.device),
             "x_next":    x_next,
             "done":      self.done[indices].to(self.device),
@@ -368,6 +374,49 @@ def compute_adaptive_strike_lengths(
     else:
         lengths[active] = adaptive_lengths[active]
     return lengths
+
+
+def min_realizable_contact_velocity_np(strike_lengths: np.ndarray) -> np.ndarray:
+    """Minimum midpoint/contact velocity allowed by strike_max_duration."""
+    lengths = np.asarray(strike_lengths, dtype=np.float32)
+    return (
+        float(quintic_poly_derivative(0.5))
+        * lengths
+        / STRIKE_MAX_DURATION
+    ).astype(np.float32)
+
+
+def clamp_command_velocity_np(
+    velocities: np.ndarray,
+    strike_lengths: np.ndarray,
+) -> np.ndarray:
+    """Clamp nominal action velocity to what the quintic executor can realize."""
+    v_min = min_realizable_contact_velocity_np(strike_lengths)
+    return np.clip(velocities, v_min, VELOCITY_MAX).astype(np.float32)
+
+
+def clamp_action_velocity_torch(
+    params: torch.Tensor,
+    strike_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Torch equivalent for critic/actor conditioning during training.
+
+    The forward value is clamped to the executable range.  Gradients through
+    the velocity channel are straight-through so an actor that fell below the
+    physical minimum can still learn its way back up.
+    """
+    v_min = (
+        float(quintic_poly_derivative(0.5))
+        * strike_lengths.to(params.device, dtype=params.dtype)
+        / STRIKE_MAX_DURATION
+    )
+    raw_velocity = params[:, 2:3]
+    executable_velocity = torch.maximum(
+        raw_velocity.clamp(min=0.0, max=VELOCITY_MAX),
+        v_min,
+    )
+    velocity = raw_velocity + (executable_velocity - raw_velocity).detach()
+    return torch.cat([params[:, :2], velocity], dim=1)
 
 
 def _ensure_xform(stage, path: str):
@@ -674,6 +723,15 @@ def _normalise_xy(v: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarr
     return (v / norm).astype(np.float32)
 
 
+def sample_heuristic_velocity() -> np.float32:
+    low, high = HEURISTIC_VELOCITY_RANGE
+    low = max(0.0, float(low))
+    high = min(float(high), VELOCITY_MAX)
+    if high < low:
+        high = low
+    return np.float32(np.random.uniform(low, high))
+
+
 def heuristic_poke_actions(
     contour_masks: torch.Tensor,
     poses_before: dict,
@@ -689,7 +747,7 @@ def heuristic_poke_actions(
     B = contour_masks.shape[0]
     pixel_ij = np.zeros((B, 2), dtype=np.int32)
     d_xy = np.zeros((B, 2), dtype=np.float32)
-    delta_d = np.full(B, 0.05, dtype=np.float32)
+    delta_d = np.full(B, HEURISTIC_VELOCITY_RANGE[0], dtype=np.float32)
 
     masks_cpu = contour_masks.detach().cpu()
     env_offsets = env_root_pos[:, :2]
@@ -734,7 +792,7 @@ def heuristic_poke_actions(
             pixel_ij[b] = valid_pixels[nearest]
             noisy_dir = goal_dir + np.random.randn(2).astype(np.float32) * 0.05
             d_xy[b] = _normalise_xy(noisy_dir, fallback=goal_dir)
-            delta_d[b] = np.float32(0.045 + abs(np.random.randn()) * 0.015)
+            delta_d[b] = sample_heuristic_velocity()
             continue
 
         inward_scores = (current_xy[None, :] - contact_xys) @ goal_dir
@@ -754,7 +812,7 @@ def heuristic_poke_actions(
         pixel_ij[b] = candidate_pixels[chosen]
         noisy_dir = goal_dir + np.random.randn(2).astype(np.float32) * 0.10
         d_xy[b] = _normalise_xy(noisy_dir, fallback=goal_dir)
-        delta_d[b] = np.float32(0.045 + abs(np.random.randn()) * 0.015)
+        delta_d[b] = sample_heuristic_velocity()
 
     return pixel_ij, d_xy, delta_d
 
@@ -822,7 +880,7 @@ def select_action(
                     pixel_ij[b, 0] = valid[0][r].item()
                     pixel_ij[b, 1] = valid[1][r].item()
                     d_noisy = np.random.randn(2).astype(np.float32)
-                    dd_noisy = 0.05 + abs(np.float32(np.random.randn())) * 0.02
+                    dd_noisy = sample_heuristic_velocity()
             else:
                 # greedy: pre-computed per-pixel-conditioned best pixel
                 pixel_ij[b, 0] = greedy_pix[b, 0].item()
@@ -1225,6 +1283,7 @@ def train_step(
     pixel   = batch["pixel"]       # (B, 2)
     d_xy_st = batch["d_xy"]        # (B, 2)  stored (with noise)
     v_st    = batch["velocity"]      # (B, 1)  stored velocity (m/s)
+    L_st    = batch["strike_length"]  # (B, 1)  executed strike travel (m)
     r       = batch["r"]           # (B, 1)
     x_next  = batch["x_next"]
     done    = batch["done"]        # (B, 1)
@@ -1236,7 +1295,10 @@ def train_step(
     target_net.eval()
 
     #* -- stored action params (with exploration noise, as executed) -----
-    a_stored = torch.cat([d_xy_st, v_st], dim=1)  # (B, 3)
+    a_stored = clamp_action_velocity_torch(
+        torch.cat([d_xy_st, v_st], dim=1),
+        L_st,
+    )  # (B, 3)
 
     #* =================================================================
     #*  LOSS 1 — Q-Loss (Huber TD)
@@ -1282,6 +1344,7 @@ def train_step(
 
     #* actor params at the stored pixel
     params_actor_at = actor_critic.params_at_pixel(params_act, pixel)  # (B, 3)
+    params_actor_at = clamp_action_velocity_torch(params_actor_at, L_st)
 
     #* FiLM from actor params (forward only — film weights frozen, no gradients)
     film_gamma, film_beta = actor_critic.film(params_actor_at)
@@ -1463,6 +1526,7 @@ class Trainer:
         greedy_velocity_samples = []
         strike_length_samples = []
         policy_selected_count = 0
+        stop_reason = "max_steps"
 
         for step in range(MAX_STEPS):
             has_contour = contour_masks.any(dim=(-2, -1)).cpu().numpy()
@@ -1498,6 +1562,7 @@ class Trainer:
                 self.K,
                 active=was_active,
             )
+            delta_d = clamp_command_velocity_np(delta_d, strike_lengths)
             if was_active.any():
                 selected_velocity_samples.append(delta_d[was_active])
                 contact_velocity_samples.append(
@@ -1540,13 +1605,21 @@ class Trainer:
                 env_root_pos=self._env_root_pos,
             )
             contour_masks_next = x_next[:, 0] > 0  # match network observation exactly
+            remaining_active_next = int(
+                (~self._done_once & contour_masks_next.cpu().numpy().any(axis=(-2, -1))).sum()
+            )
+            early_truncated = (
+                not self._done_once.all()
+                and remaining_active_next <= MIN_ACTIVE_ENVS
+            )
 
             #* — store transitions for envs active at step start ——————
-            truncated = (step == MAX_STEPS - 1)
+            truncated = (step == MAX_STEPS - 1) or early_truncated
             for b in range(NUM_ENVS):
                 if was_active[b]:
                     self.buffer.push(
-                        x[b:b+1], pixel_ij[b], d_xy[b], float(delta_d[b]),
+                        x[b:b+1], pixel_ij[b], d_xy[b],
+                        float(delta_d[b]), float(strike_lengths[b]),
                         float(rewards[b]), x_next[b:b+1],
                         bool(self._done_once[b] or truncated),
                     )
@@ -1572,6 +1645,11 @@ class Trainer:
                     soft_update(self.target_net, self.actor_critic, TAU)
 
             if self._done_once.all():
+                stop_reason = "all_done"
+                break
+
+            if early_truncated:
+                stop_reason = "min_active"
                 break
 
         self.ep_returns.append(ep_return)
@@ -1580,6 +1658,7 @@ class Trainer:
         self._last_ep_active_steps = ep_active_steps
         self._last_done_count = int(self._done_once.sum())
         self._last_lost_count = int((~final_has_contour).sum())
+        self._last_stop_reason = stop_reason
         self._last_velocity_stats = self._summarize_velocity_stats(
             selected_velocity_samples,
             contact_velocity_samples,
@@ -1632,6 +1711,7 @@ class Trainer:
         active_steps = getattr(self, "_last_ep_active_steps", 0)
         done_count = getattr(self, "_last_done_count", 0)
         lost_count = getattr(self, "_last_lost_count", 0)
+        stop_reason = getattr(self, "_last_stop_reason", "max_steps")
         velocity_stats = getattr(self, "_last_velocity_stats", {})
         r_per_active = ep_return / max(1, active_steps)
         active_summary = ""
@@ -1657,7 +1737,7 @@ class Trainer:
             f"r/active={r_per_active:7.4f}  "
             f"ε={self.epsilon:.3f}  σ={self.noise_std:.3f}  "
             f"buf={self.buffer.size:6d}  dt={elapsed:.1f}s  "
-            f"done={done_count:2d}  lost={lost_count:2d}"
+            f"done={done_count:2d}  lost={lost_count:2d}  stop={stop_reason}"
             f"{velocity_summary}"
             f"{active_summary}"
         )
@@ -1685,6 +1765,7 @@ class Trainer:
             "buffer_pixel":   self.buffer.pixel[:self.buffer.size],
             "buffer_d_xy":    self.buffer.d_xy[:self.buffer.size],
             "buffer_velocity": self.buffer.velocity[:self.buffer.size],
+            "buffer_strike_length": self.buffer.strike_length[:self.buffer.size],
             "buffer_r":       self.buffer.r[:self.buffer.size],
             "buffer_done":    self.buffer.done[:self.buffer.size],
             "buffer_ptr":     self.buffer.ptr,
@@ -1725,6 +1806,10 @@ class Trainer:
         self.buffer.pixel[:s].copy_(ckpt["buffer_pixel"][:s])
         self.buffer.d_xy[:s].copy_(ckpt["buffer_d_xy"][:s])
         self.buffer.velocity[:s].copy_(ckpt["buffer_velocity"][:s])
+        if "buffer_strike_length" in ckpt:
+            self.buffer.strike_length[:s].copy_(ckpt["buffer_strike_length"][:s])
+        else:
+            self.buffer.strike_length[:s].fill_(L_STRIKE)
         self.buffer.r[:s].copy_(ckpt["buffer_r"][:s])
         self.buffer.done[:s].copy_(ckpt["buffer_done"][:s])
 
