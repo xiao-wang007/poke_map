@@ -73,7 +73,7 @@ training:
 
   eps_start: 1.0
   eps_end: 0.05
-  eps_decay_episodes: 120
+  eps_decay_episodes: 250
   sigma_start: 0.3
   sigma_end: 0.05
 
@@ -94,7 +94,7 @@ training:
   l_strike: 0.15               # m — total strike travel distance (0.5L behind → 0.5L ahead)
   l_strike_min: 0.05           # m — shortest adaptive strike travel near targets
   strike_control_freq: 60     # Hz — trajectory control frequency
-  strike_max_duration: 2.0    # s  — clamp upper bound on strike duration
+  strike_max_duration: 0.35   # s  — keep strikes impulsive; low v becomes a short tap, not a slow push
   strike_min_steps: 3         # minimum trajectory steps
   poke_settle_steps: 5       # physics steps to settle objects after each poke
 

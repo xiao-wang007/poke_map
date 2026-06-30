@@ -1134,6 +1134,10 @@ class Trainer:
         greedy_velocity_samples = []
         strike_length_samples = []
         policy_selected_count = 0
+        policy_reward_sum = 0.0
+        heuristic_reward_sum = 0.0
+        policy_reward_count = 0
+        heuristic_reward_count = 0
         stop_reason = "max_steps"
         termination = EpisodeTermination(
             NUM_ENVS, self._targets_pos, self._env_root_pos)
@@ -1199,6 +1203,14 @@ class Trainer:
                 yaw_success_enabled=YAW_SUCCESS_ENABLED)
             termination.apply_reward_done(self._done_once)
             rewards[~was_active] = 0.0
+            policy_active = is_policy_action & was_active
+            heuristic_active = ~is_policy_action & was_active
+            if policy_active.any():
+                policy_reward_sum += float(rewards[policy_active].sum())
+                policy_reward_count += int(policy_active.sum())
+            if heuristic_active.any():
+                heuristic_reward_sum += float(rewards[heuristic_active].sum())
+                heuristic_reward_count += int(heuristic_active.sum())
 
             #* — observe next state ——————————————————————————
             x_next, seg_maps_next = build_vision_observation(
@@ -1260,6 +1272,10 @@ class Trainer:
             strike_length_samples,
             policy_selected_count,
             ep_active_steps,
+            policy_reward_sum,
+            policy_reward_count,
+            heuristic_reward_sum,
+            heuristic_reward_count,
         )
 
         return ep_return, ep_len
@@ -1281,6 +1297,10 @@ class Trainer:
         strike_length_samples: list[np.ndarray],
         policy_selected_count: int,
         active_steps: int,
+        policy_reward_sum: float,
+        policy_reward_count: int,
+        heuristic_reward_sum: float,
+        heuristic_reward_count: int,
     ) -> dict[str, float]:
         sel_mean, sel_max = self._mean_max(selected_samples)
         contact_mean, contact_max = self._mean_max(contact_samples)
@@ -1296,6 +1316,8 @@ class Trainer:
             "strike_l_mean": strike_l_mean,
             "strike_l_max": strike_l_max,
             "policy_frac": policy_selected_count / max(1, active_steps),
+            "policy_reward": policy_reward_sum / max(1, policy_reward_count),
+            "heuristic_reward": heuristic_reward_sum / max(1, heuristic_reward_count),
         }
 
     def log(self, episode: int, ep_return: float, ep_len: int, elapsed: float):
@@ -1323,6 +1345,8 @@ class Trainer:
                 f"  strike_L={velocity_stats['strike_l_mean']:.3f}/"
                 f"{velocity_stats['strike_l_max']:.3f}"
                 f"  policy={100.0 * velocity_stats['policy_frac']:.1f}%"
+                f"  r_pol={velocity_stats['policy_reward']:.4f}"
+                f"  r_heur={velocity_stats['heuristic_reward']:.4f}"
             )
         print(
             f"[ep {episode:5d}] "
