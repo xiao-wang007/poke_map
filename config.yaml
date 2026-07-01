@@ -74,7 +74,7 @@ training:
 
   eps_start: 1.0
   eps_end: 0.05
-  eps_decay_episodes: 250
+  eps_decay_episodes: 600
   sigma_start: 0.3
   sigma_end: 0.05
 
@@ -87,6 +87,7 @@ training:
   success_threshold: 0.02
   stop_poke_threshold: 0.035
   target_halfplane_min_dot: 0.0  # dot(action_dir, object_to_target_dir); -1 disables, 0 = half-plane
+  lambda_dir: 0.3               # weight for direction alignment BC loss in DPG step
 
   velocity_max: 1.5
   heuristic_velocity_range: [0.3, 1.0]

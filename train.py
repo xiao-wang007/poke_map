@@ -140,6 +140,7 @@ STRIKE_MAX_DURATION: float = TRAIN_CONFIG["strike_max_duration"]
 STRIKE_MIN_STEPS: int = TRAIN_CONFIG["strike_min_steps"]
 POKE_SETTLE_STEPS: int = TRAIN_CONFIG["poke_settle_steps"]
 TARGET_HALFPLANE_MIN_DOT: float = TRAIN_CONFIG.get("target_halfplane_min_dot", 0.0)
+LAMBDA_DIR: float = TRAIN_CONFIG.get("lambda_dir", 0.0)
 FINGERTIP_RADIUS: float = FINGER_CONFIG["sphere_radius"]
 POKE_Z: float = OBJECT_HEIGHT * 0.5
 SAFE_Z: float = TRAIN_CONFIG["safe_z"]
@@ -976,6 +977,16 @@ def train_step(
     #* actor params at the stored pixel
     params_actor_at = actor_critic.params_at_pixel(params_act, pixel)  # (B, 3)
 
+    #* direction alignment loss — penalise directions in the wrong half-plane
+    #* computed BEFORE the constraint so the actor gets a direct training signal
+    #* rather than relying on the piecewise reflection to carry gradients.
+    actor_dir = F.normalize(params_actor_at[:, :2], dim=1, eps=1e-6)  # (B, 2)
+    goal_dir  = F.normalize(target_dir_st, dim=1, eps=1e-6)           # (B, 2)
+    cos_sim   = (actor_dir * goal_dir).sum(dim=1)                     # (B,)
+
+    #! added poke direction loss
+    L_dir     = F.relu(-cos_sim).mean()                               # penalise dot < 0
+
     #! Actor / param-head update uses the same constraint
     params_actor_at = constrain_params_target_half_plane_torch(
         params_actor_at,
@@ -990,7 +1001,7 @@ def train_step(
     q_map_pg = actor_critic.q_head(f_mod_pg)   # q_head frozen, just forward
     q_val_pg = q_map_pg[batch_idx, 0, pixel[:, 0], pixel[:, 1]]  # (B,)
 
-    L_mu = -q_val_pg.mean()
+    L_mu = -q_val_pg.mean() + LAMBDA_DIR * L_dir
 
     optimizer_mu.zero_grad()
     L_mu.backward()
