@@ -98,10 +98,12 @@ def compute_rewards(
 
     oob_after = ~objects_in_workspace(poses_after, env_root_pos)
     reward[oob_after] += C_OOB
-    done |= oob_after
 
-    first_done = done & ~done_once
-    reward[first_done] += C_SUCCESS
+    # success bonus: only for genuine task completion, not OOB
+    first_success = done & ~done_once & ~oob_after
+    reward[first_success] += C_SUCCESS
+
+    done |= oob_after
     done_once = done_once | done
 
     return reward, done, done_once

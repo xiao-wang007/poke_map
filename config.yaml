@@ -82,12 +82,12 @@ training:
   min_active_envs: 5
   c_step: 0.02
   c_success: 10.0
-  c_oob: -5.0
+  c_oob: -5.0 # out-of-bounds penalty
   c_target_separation: 0.05
   success_threshold: 0.02
   stop_poke_threshold: 0.035
   target_halfplane_min_dot: 0.0  # dot(action_dir, object_to_target_dir); -1 disables, 0 = half-plane
-  lambda_dir: 0.3               # weight for direction alignment BC loss in DPG step
+  lambda_dir: 0.3               # weight for direction alignment (Half-plane direction) loss in DPG step
 
   velocity_max: 1.5
   heuristic_velocity_range: [0.3, 1.0]
