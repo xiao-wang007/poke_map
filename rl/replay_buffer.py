@@ -17,19 +17,20 @@ DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 class ReplayBuffer:
     """Ring buffer storing one active env transition per entry."""
 
-    def __init__(self, capacity: int = BUFFER_CAPACITY, device: str = DEVICE):
+    def __init__(self, capacity: int = BUFFER_CAPACITY, device: str = DEVICE, input_channels: int = 4):
         self.capacity = capacity
         self.device = device
 
         height, width = RESOLUTION
-        self.x = torch.zeros(capacity, 2, height, width, dtype=torch.uint8)
+        self.input_channels = input_channels
+        self.x = torch.zeros(capacity, input_channels, height, width, dtype=torch.uint8)
         self.pixel = torch.zeros(capacity, 2, dtype=torch.long)
         self.d_xy = torch.zeros(capacity, 2)
         self.target_dir = torch.zeros(capacity, 2)
         self.velocity = torch.zeros(capacity, 1)
         self.strike_length = torch.zeros(capacity, 1)
         self.r = torch.zeros(capacity, 1)
-        self.x_next = torch.zeros(capacity, 2, height, width, dtype=torch.uint8)
+        self.x_next = torch.zeros(capacity, input_channels, height, width, dtype=torch.uint8)
         self.done = torch.zeros(capacity, 1, dtype=torch.bool)
 
         self.ptr = 0
@@ -83,7 +84,7 @@ class ReplayBuffer:
             "r": self.r[indices].to(self.device),
             "x_next": x_next,
             "done": self.done[indices].to(self.device),
-            "mask_next": x_next[:, 0] > 0,
+            "mask_next": (x_next[:, :2] > 0).any(dim=1),
         }
 
     def __len__(self) -> int:

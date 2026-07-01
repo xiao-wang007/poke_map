@@ -432,6 +432,31 @@ def get_circle_masks_2d(
     return masks
 
 
+def get_circle_masks_2d_batched(
+    object_positions: np.ndarray,  # (N, 3)
+    radius: float,
+    K: np.ndarray,
+    resolution: tuple[int, int] = RESOLUTION,
+) -> np.ndarray:
+    """Rasterize N circular footprints at once via broadcasting → (N, H, W)."""
+    H, W = resolution
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    center_col = object_positions[:, 0] * fx + cx  # (N,)
+    center_row = object_positions[:, 1] * fy + cy  # (N,)
+    radius_cols = radius * fx
+    radius_rows = radius * fy
+
+    rows, cols = np.ogrid[:H, :W]
+    masks = (
+        ((cols[None, :, :] - center_col[:, None, None]) / radius_cols) ** 2
+        + ((rows[None, :, :] - center_row[:, None, None]) / radius_rows) ** 2
+        <= 1.0
+    )
+    return masks  # (N, H, W) bool
+
+
 def get_l_shape_masks_2d(
     object_positions: np.ndarray,
     object_orientations: np.ndarray,
@@ -523,29 +548,46 @@ def render_segmentation_ground_truth(
     seg_maps : list of (H, W) int arrays, one per environment.
     """
     num_envs = list(env_poses.values())[0][0].shape[0]
-
+    obj_names = list(env_poses.keys())  # deterministic iteration order
     H, W = resolution
-    seg_maps = []
 
+    offset = env_root_pos[:, :2].copy() if env_root_pos is not None else np.zeros((num_envs, 2), dtype=np.float32)
+
+    # Pre-render Cylinder masks in one batched pass
+    cyl_key = "Cylinder"
+    cyl_local = np.zeros((num_envs, 3), dtype=np.float32)
+    if cyl_key in env_poses:
+        cyl_world = env_poses[cyl_key][0]
+        cyl_local[:, :2] = cyl_world[:, :2] - offset
+        cyl_local[:, 2] = cyl_world[:, 2]
+    cyl_masks = get_circle_masks_2d_batched(
+        cyl_local, SCENE_CONFIG["cylinder_radius"], K, resolution
+    )  # (N, H, W) bool
+
+    seg_maps = []
     for env_idx in range(num_envs):
         seg = np.zeros((H, W), dtype=np.int32)
-
-        #* env offset — convert world coords to local (env-centred)
-        offset = env_root_pos[env_idx, :2] if env_root_pos is not None else np.zeros(2)
         obj_id = 0
-        for obj_name, (positions, quaternions) in env_poses.items():
-            #* shift to env-local coordinates
-            local_pos = positions[env_idx:env_idx + 1].copy()
-            local_pos[:, :2] -= offset
-            masks = get_object_masks_2d(
-                object_name=obj_name,
-                object_positions=local_pos,
-                object_orientations=quaternions[env_idx:env_idx + 1],
-                K=K,
-                resolution=resolution,
-            )
+
+        for obj_name in obj_names:
             obj_id += 1
-            seg[masks[0]] = obj_id
+            if obj_name == cyl_key:
+                mask = cyl_masks[env_idx]
+            else:
+                positions = env_poses[obj_name][0]
+                quaternions = env_poses[obj_name][1]
+                local_pos = positions[env_idx:env_idx + 1].copy()
+                local_pos[:, :2] -= offset[env_idx]
+                masks = get_object_masks_2d(
+                    object_name=obj_name,
+                    object_positions=local_pos,
+                    object_orientations=quaternions[env_idx:env_idx + 1],
+                    K=K,
+                    resolution=resolution,
+                )
+                mask = masks[0]
+            seg[mask] = obj_id
+
         seg_maps.append(seg)
 
     return seg_maps
@@ -587,14 +629,11 @@ def mask_to_contour(
     return contour, contour_com_pixel
 
 
-def segmentation_to_contour_current(
+def segmentation_to_per_object_contours(
     seg: np.ndarray,
     kernel_size: int = 3,
-) -> np.ndarray:
-    """Convert instance segmentation to a single binary contour image.
-
-    Object boundaries are merged into one channel — the policy does not
-    need per-object identity (collective treatment).
+) -> dict[int, np.ndarray]:
+    """Convert instance segmentation to per-object binary contour images.
 
     Parameters
     ----------
@@ -603,15 +642,26 @@ def segmentation_to_contour_current(
 
     Returns
     -------
-    contour : (H, W) float32 in [0, 1].
+    dict[int, np.ndarray] — obj_id → (H, W) float32 contour in [0, 1].
     """
-    combined = np.zeros_like(seg, dtype=bool)
+    contours: dict[int, np.ndarray] = {}
     for obj_id in np.unique(seg):
         if obj_id == 0:
             continue
         contour, _ = mask_to_contour(seg == obj_id, kernel_size=kernel_size)
-        combined |= contour
-    return combined.astype(np.float32)
+        contours[int(obj_id)] = contour.astype(np.float32)
+    return contours
+
+
+def segmentation_to_contour_current(
+    seg: np.ndarray,
+    kernel_size: int = 3,
+) -> np.ndarray:
+    """Merged object contours (for backward compat / debugging)."""
+    combined = np.zeros_like(seg, dtype=np.float32)
+    for contour in segmentation_to_per_object_contours(seg, kernel_size).values():
+        combined = np.maximum(combined, contour)
+    return combined
 
 
 #* ---------------------------------------------------------------------------
@@ -659,6 +709,39 @@ def render_goal_contour(
 
     contour, _ = mask_to_contour(combined, kernel_size=kernel_size)
     return contour.astype(np.float32)
+
+
+def render_goal_contours_batched(
+    object_name: str,
+    target_positions: np.ndarray,        # (N, 3)
+    target_orientations: np.ndarray,     # (N, 4) quat
+    K: np.ndarray,
+    resolution: tuple[int, int] = RESOLUTION,
+    kernel_size: int = 3,
+) -> np.ndarray:
+    """Render per-env goal contours for one object type in a single batched pass.
+
+    Returns (N, H, W) float32 contour array.
+    """
+    N = target_positions.shape[0]
+    H, W = resolution
+
+    if object_name == "Cylinder":
+        radius = SCENE_CONFIG["cylinder_radius"]
+        masks = get_circle_masks_2d_batched(target_positions, radius, K, resolution)  # (N, H, W)
+    elif object_name == "LObject":
+        # L-shape polygon fill is still per-env internally, but called once
+        mask_list = get_l_shape_masks_2d(target_positions, target_orientations, K, resolution)
+        masks = np.stack(mask_list, axis=0)  # (N, H, W)
+    else:
+        raise ValueError(f"Unknown object type: {object_name}")
+
+    contours = np.zeros((N, H, W), dtype=np.float32)
+    for n in range(N):
+        if masks[n].any():
+            contour, _ = mask_to_contour(masks[n], kernel_size=kernel_size)
+            contours[n] = contour.astype(np.float32)
+    return contours
 
 
 def render_goal_contour_scene(
@@ -740,7 +823,7 @@ def build_vision_observation(
     resolution: tuple[int, int] = RESOLUTION,
     env_root_pos: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, list[np.ndarray]]:
-    """Full observation pipeline: seg → contours → stacked tensor.
+    """Full observation pipeline: seg → per-object contours → stacked tensor.
 
     Parameters
     ----------
@@ -753,33 +836,42 @@ def build_vision_observation(
 
     Returns
     -------
-    x : (N_envs, 2, H, W) stacked contour tensor.
+    x : (N_envs, 4, H, W) stacked contour tensor.
+        Channels: [LObject_contour, Cylinder_contour, LObject_goal, Cylinder_goal]
     seg_maps : list of (H, W) int arrays, one per env (useful for debug).
     """
     num_envs = list(env_poses.values())[0][0].shape[0]
+    obj_names = list(env_poses.keys())  # deterministic iteration order
+    n_objects = len(obj_names)
+    H, W = resolution
+
     seg_maps = render_segmentation_ground_truth(env_poses, K, resolution, env_root_pos)
 
-    contour_currents = []
-    contour_goals = []
+    # Pre-render all goal contours in batched passes (one per object type)
+    goal_contours = {}  # obj_name → (N, H, W) float32
+    for obj_name in obj_names:
+        goal_contours[obj_name] = render_goal_contours_batched(
+            obj_name,
+            target_positions[obj_name],
+            target_orientations[obj_name],
+            K, resolution,
+        )
+
+    all_channels = []
     for env_idx in range(num_envs):
-        contour_currents.append(
-            segmentation_to_contour_current(seg_maps[env_idx])
-        )
+        obj_contours = segmentation_to_per_object_contours(seg_maps[env_idx])
 
-        # per-env goal contour — targets are already env-local, no offset needed
-        env_targets = {}
-        for name, tpos in target_positions.items():
-            env_targets[name] = tpos[env_idx:env_idx + 1].copy()
-        env_oris = {name: ori[env_idx:env_idx + 1]
-                    for name, ori in target_orientations.items()}
-        contour_goals.append(
-            render_goal_contour(env_targets, env_oris, K, resolution)
-        )
+        current_channels = []
+        for i in range(n_objects):
+            obj_id = i + 1
+            contour = obj_contours.get(obj_id, np.zeros((H, W), dtype=np.float32))
+            current_channels.append(contour)
 
-    contour_current_batch = np.stack(contour_currents, axis=0)  # (N, H, W)
-    contour_goal_batch = np.stack(contour_goals, axis=0)        # (N, H, W)
+        goal_channels = [goal_contours[name][env_idx] for name in obj_names]
+        env_channels = np.stack(current_channels + goal_channels, axis=0)  # (2*n_objects, H, W)
+        all_channels.append(env_channels)
 
-    x = stack_input(contour_current_batch, contour_goal_batch)
+    x = torch.from_numpy(np.stack(all_channels, axis=0)).float()  # (N, 2*n_objects, H, W)
     return x, seg_maps
 
 

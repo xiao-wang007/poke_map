@@ -66,7 +66,7 @@ class UNet(nn.Module):
     Output (B, C, H, W)     — feature map at original resolution.
     """
 
-    def __init__(self, in_channels: int = 2, base_channels: int = 32):
+    def __init__(self, in_channels: int = 4, base_channels: int = 32):
         super().__init__()
         c = base_channels
         self.inc   = DoubleConv(in_channels, c)
@@ -121,7 +121,7 @@ class FiLM(nn.Module):
 class SpatialActorCritic(nn.Module):
     """Actor-Critic with shared U-Net backbone and FiLM-conditioned Q-head.
 
-    Input  (B, 2, H, W) — contour_current + contour_goal
+    Input  (B, 4, H, W) — per-object contour channels
     Output q_map  (B, 1, H, W) — per-pixel Q-values (critic)
            params (B, 3, H, W) — (d̑_x, d̑_y, v) per pixel, activated
 
@@ -148,7 +148,7 @@ class SpatialActorCritic(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 2,
+        in_channels: int = 4,
         base_channels: int = 32,
         velocity_max: float = 0.4,
     ):
@@ -202,8 +202,8 @@ class SpatialActorCritic(nn.Module):
         params_raw = self.param_head(f)            # (B, 3, H, W)
         params = self._activate_params(params_raw) # (B, 3, H, W)
 
-        # contour-masked mean — only object pixels contribute to FiLM
-        contour_mask = (x[:, 0:1] > 0.0).float()   # (B, 1, H, W)
+        # contour-masked mean — object pixels from all current-contour channels
+        contour_mask = (x[:, 0:2] > 0.0).any(dim=1, keepdim=True).float()  # (B, 1, H, W)
         counts = contour_mask.sum(dim=[-2, -1]).clamp(min=1)  # (B, 1)
         params_global = (params * contour_mask).sum(dim=[-2, -1]) / counts  # (B, 3)
         gamma, beta = self.film(params_global)

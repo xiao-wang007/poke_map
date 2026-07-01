@@ -1031,6 +1031,88 @@ def soft_update(target: SpatialActorCritic, online: SpatialActorCritic, tau: flo
 
 
 #* ================================================================
+#*  Contact validity mask
+#* ================================================================
+
+def compute_contact_validity_mask(
+    contour_masks: torch.Tensor,          # (N, H, W) bool
+    poses: dict,
+    targets_pos: dict[str, np.ndarray],
+    env_root_pos: np.ndarray,
+    K: np.ndarray,
+) -> torch.Tensor:
+    """Per-pixel backside validity mask for contact selection.
+
+    A contour pixel is valid only when its inward normal lies in the same
+    half-plane as the object-to-target direction::
+
+        dot(obj_center - pixel_world_xy, obj_to_target_dir) > 0
+
+    Front-side contacts (near-target face) are excluded because approaching
+    them requires the finger standoff to be inside the object — physically
+    impossible.  Side contacts (for separation / rotation pokes) are kept
+    because their inward normal is roughly perpendicular to the goal direction
+    and a valid approach from the side still satisfies the criterion.
+
+    Falls back to the full contour mask for any env where no valid pixel
+    is found (e.g. object exactly at its target).
+
+    Returns (N, H, W) bool tensor on CPU.
+    """
+    N, H, W = contour_masks.shape
+    env_offsets = env_root_pos[:, :2]
+    object_names = list(targets_pos.keys())
+
+    validity = np.zeros((N, H, W), dtype=bool)
+
+    for env_idx in range(N):
+        contour_np = contour_masks[env_idx].cpu().numpy()
+        rows_px, cols_px = np.where(contour_np)              # contour pixel indices
+        if len(rows_px) == 0:
+            continue
+
+        # World XY only for contour pixels  (P, 2)
+        px_world_x = (cols_px - K[0, 2]) / K[0, 0]
+        px_world_y = (rows_px - K[1, 2]) / K[1, 1]
+
+        best_score = np.full(len(rows_px), -np.inf, dtype=np.float32)  # (P,)
+        best_dist  = np.full(len(rows_px),  np.inf, dtype=np.float32)  # (P,)
+
+        for obj_name in object_names:
+            local_center = (
+                poses[obj_name][0][env_idx, :2] - env_offsets[env_idx]
+            ).astype(np.float32)                              # (2,)
+
+            to_target = (
+                targets_pos[obj_name][env_idx, :2] - local_center
+            ).astype(np.float32)
+            t_norm = float(np.linalg.norm(to_target))
+            if t_norm < 1e-6:
+                continue
+            goal_dir = to_target / t_norm                     # (2,)
+
+            # Inward vector: from contour pixel toward object center  (P,)
+            inward_x = local_center[0] - px_world_x
+            inward_y = local_center[1] - px_world_y
+            dist = np.sqrt(inward_x ** 2 + inward_y ** 2) + 1e-8
+
+            # Inward score = dot(inward_unit, goal_dir)
+            score = (inward_x * goal_dir[0] + inward_y * goal_dir[1]) / dist
+
+            closer = dist < best_dist
+            best_score = np.where(closer, score, best_score)
+            best_dist  = np.where(closer, dist,  best_dist)
+
+        valid_px = best_score > 0.0                           # (P,) bool
+        if valid_px.any():
+            validity[env_idx, rows_px[valid_px], cols_px[valid_px]] = True
+        else:
+            validity[env_idx, rows_px, cols_px] = True        # fallback
+
+    return torch.from_numpy(validity)
+
+
+#* ================================================================
 #*  Main training loop
 #* ================================================================
 
@@ -1038,8 +1120,8 @@ class Trainer:
     """Orchestrates the training loop inside the Isaac Sim Script Editor."""
 
     def __init__(self):
-        self.actor_critic = SpatialActorCritic(velocity_max=VELOCITY_MAX).to(DEVICE)
-        self.target_net   = SpatialActorCritic(velocity_max=VELOCITY_MAX).to(DEVICE)
+        self.actor_critic = SpatialActorCritic(velocity_max=VELOCITY_MAX, in_channels=4).to(DEVICE)
+        self.target_net   = SpatialActorCritic(velocity_max=VELOCITY_MAX, in_channels=4).to(DEVICE)
         soft_update(self.target_net, self.actor_critic, tau=1.0)  # copy
 
         #* param groups for separate optimizers
@@ -1153,7 +1235,7 @@ class Trainer:
             poses_before, targets_pos, targets_ori, self.K,
             env_root_pos=env_root_pos,
         )
-        contour_masks = (x[:, 0] > 0).to(torch.bool)  # match network observation exactly
+        contour_masks = (x[:, :2] > 0).any(dim=1)  # OR of per-object current contours
 
         self._targets_pos = targets_pos
         self._targets_ori = targets_ori
@@ -1164,6 +1246,9 @@ class Trainer:
     async def train_episode(self, episode: int):
         self._decay_schedule(episode)
         x, contour_masks, poses_before = await self._reset_episode(episode)
+        contact_validity_masks = compute_contact_validity_mask(
+            contour_masks, poses_before, self._targets_pos, self._env_root_pos, self.K
+        ).to(DEVICE)
 
         ep_return = 0.0
         ep_len = 0
@@ -1200,7 +1285,7 @@ class Trainer:
                 self.K,
             )
             pixel_ij, d_xy, delta_d, is_policy_action, greedy_velocity = select_action(
-                self.actor_critic, x, contour_masks,
+                self.actor_critic, x, contact_validity_masks,
                 self.epsilon, self.noise_std,
                 heuristic_actions=heuristic_actions,
             )
@@ -1273,7 +1358,10 @@ class Trainer:
                 poses_after, self._targets_pos, self._targets_ori, self.K,
                 env_root_pos=self._env_root_pos,
             )
-            contour_masks_next = x_next[:, 0] > 0  # match network observation exactly
+            contour_masks_next = (x_next[:, :2] > 0).any(dim=1)  # OR of per-object current contours
+            contact_validity_masks_next = compute_contact_validity_mask(
+                contour_masks_next, poses_after, self._targets_pos, self._env_root_pos, self.K
+            )
             final_has_contour, remaining_active_next, early_truncated = (
                 termination.finish_step(poses_after, contour_masks_next)
             )
@@ -1295,6 +1383,7 @@ class Trainer:
             #* — advance state ————————————————————————————————
             x = x_next.to(DEVICE)
             contour_masks = contour_masks_next.to(DEVICE)
+            contact_validity_masks = contact_validity_masks_next.to(DEVICE)
             poses_before = poses_after
             self.global_step += 1
 

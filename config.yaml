@@ -5,7 +5,7 @@ scene:
   cylinder_radius: 0.05
   l_collision_approximation: convexHull
   cylinder_collision_approximation: convexHull
-  num_envs: 128
+  num_envs: 512
   env_spacing: 1.8
   envs_root_path: /World/envs
   source_env_name: env_0
@@ -65,21 +65,21 @@ training:
   gamma: 0.95
   lr: 0.0003
   batch_size: 128
-  buffer_capacity: 100000
+  buffer_capacity: 400000
   tau: 0.005
-  train_after: 1024
+  train_after: 2048
   train_every: 1
   grad_updates_per_step: 4
   actor_update_every: 4
 
   eps_start: 1.0
   eps_end: 0.05
-  eps_decay_episodes: 600
+  eps_decay_episodes: 250
   sigma_start: 0.3
   sigma_end: 0.05
 
   max_steps_per_episode: 18
-  min_active_envs: 5
+  min_active_envs: 25
   c_step: 0.02
   c_success: 10.0
   c_oob: -5.0 # out-of-bounds penalty
